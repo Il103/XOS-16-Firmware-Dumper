@@ -111,6 +111,39 @@ jobs:
             exit 1
           fi
 
+      - name: Recover vendor_boot ramdisks if magiskboot crashed
+        run: |
+          set -euo pipefail
+          cd workspace/dumprx/out
+          if [ ! -f vendor_boot.img ]; then
+            echo "No vendor_boot.img here, nothing to do"
+            exit 0
+          fi
+          if [ -d vendor_boot/ramdisk ] && [ -n "$(ls -A vendor_boot/ramdisk 2>/dev/null)" ]; then
+            echo "vendor_boot ramdisk already extracted by DumprX"
+            exit 0
+          fi
+          echo "::warning::vendor_boot ramdisk is missing - falling back to AOSP unpack_bootimg"
+          if ! git clone -q --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg /tmp/mkbootimg; then
+            echo "::warning::Could not clone mkbootimg tools - skipping"
+            exit 0
+          fi
+          OUT="${PWD}"
+          UNPACK="${OUT}/vendor_boot/unpacked"
+          mkdir -p "${UNPACK}"
+          python3 /tmp/mkbootimg/unpack_bootimg.py --boot_img "${OUT}/vendor_boot.img" \
+            --out "${UNPACK}" --format=mkbootimg > "${OUT}/vendor_boot/unpack_bootimg.txt" 2>&1 || true
+          for rd in "${UNPACK}"/vendor_ramdisk*; do
+            [ -f "${rd}" ] || continue
+            name=$(basename "${rd}")
+            dest="${OUT}/vendor_boot/${name}"
+            mkdir -p "${dest}"
+            if ! ( cd "${dest}" && lz4 -d -c "${rd}" 2>/dev/null | cpio -idm > /dev/null 2>&1 ); then
+              echo "::warning::Could not unpack ${name}"
+            fi
+          done
+          find "${OUT}/vendor_boot" -maxdepth 2 -type d | head -40 || true
+
       - name: Collect device info
         run: |
           set -euo pipefail
