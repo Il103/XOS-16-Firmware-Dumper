@@ -1,13 +1,13 @@
 # ================================================
-# CRITICAL FIX FOR workflow_dispatch
-# The file MUST have this EXACT trigger at the TOP LEVEL so the "Run workflow" button appears.
-# If no button shows:
-# 1. Delete the current .github/workflows/dump.yml file completely from the repo
-# 2. Create new file at exactly .github/workflows/dump.yml
-# 3. Paste EVERYTHING below (starting from this comment block all the way to the end of the YAML)
-# 4. Commit directly to main
-# 5. Go to Actions tab and HARD REFRESH (Ctrl+Shift+R)
-# The green "Run workflow" button will appear.
+# CRITICAL: workflow_dispatch + YAML syntax fix (line 305 was the heredoc EOF)
+# MUST have 'on: workflow_dispatch:' at top level for the green button.
+# If syntax error:
+# 1. Delete the OLD dump.yml completely
+# 2. Create new file .github/workflows/dump.yml
+# 3. Paste the FULL content below (from this comment to the very end)
+# 4. Commit to main
+# 5. Hard refresh Actions tab
+# Now using echo {} instead of << EOF to avoid YAML parser issues on heredoc lines.
 # ================================================
 
 name: Firmware Dump to GitLab
@@ -287,49 +287,51 @@ jobs:
             echo "::notice::**FINAL FORCED for X6886**"
           fi
 
-          # Generate strong metadata files (pushed with the dump)
-          cat > device-info.txt << EOF
-Device: Infinix Hot 60 Pro Plus (X6886)
-Brand: $BRAND
-Codename: $CODENAME
-Model: $MODEL
-Build ID: $BUILD_ID
-Fingerprint: $FINGERPRINT
-Platform: mt6789
-Android: 16 (XOS)
-Kernel: 6.12.38
-A/B: true
-Treble: true
-Dump method: DumprX + AOSP unpack_bootimg fallback
-Note: magiskboot crash on vendor_boot is normal and handled. All info cleaned for accuracy. Bulletproof detection.
-EOF
-          cat > README.md << EOF
-# Firmware Dump - Infinix Hot 60 Pro Plus (X6886) - COMPLETE FULL DUMP
+          # Generate strong metadata files (pushed with the dump) - using echo to avoid heredoc YAML syntax error on line 305
+          {
+            echo "Device: Infinix Hot 60 Pro Plus (X6886)"
+            echo "Brand: $BRAND"
+            echo "Codename: $CODENAME"
+            echo "Model: $MODEL"
+            echo "Build ID: $BUILD_ID"
+            echo "Fingerprint: $FINGERPRINT"
+            echo "Platform: mt6789"
+            echo "Android: 16 (XOS)"
+            echo "Kernel: 6.12.38"
+            echo "A/B: true"
+            echo "Treble: true"
+            echo "Dump method: DumprX + AOSP unpack_bootimg fallback"
+            echo "Note: magiskboot crash on vendor_boot is normal and handled. All info cleaned for accuracy. Bulletproof detection."
+          } > device-info.txt
 
-**Android 16 XOS - Bulletproof Complete & Smart Dump**
+          {
+            echo "# Firmware Dump - Infinix Hot 60 Pro Plus (X6886) - COMPLETE FULL DUMP"
+            echo ""
+            echo "**Android 16 XOS - Bulletproof Complete & Smart Dump**"
+            echo ""
+            echo "- Brand: $BRAND"
+            echo "- Codename: $CODENAME"
+            echo "- Model: $MODEL"
+            echo "- Build: $BUILD_ID"
+            echo "- Fingerprint: $FINGERPRINT"
+            echo "- Platform: mt6789"
+            echo ""
+            echo "## Dump Structure (كل حاجة منظمة في مجلدات)"
+            echo ""
+            echo "- images/ : كل الـimages بتاعة الجهاز (boot.img, vendor_boot.img, system.img, vendor.img, ... كل حاجة)"
+            echo "- vendor_blobs/ : كل الفيندور بلوبز كاملة + vendor contents"
+            echo "- ramdisks/ : كل الرامديسكات المستخرجة (vendor_boot, boot, platform, recovery)"
+            echo "- device_info/ : كل الـprops و device-info.txt و build files"
+            echo "- proprietary_files/ : كل الـblobs والـso والـfirmware والمكونات الخاصة"
+            echo "- complete_dump_manifest.txt : قائمة كاملة بكل ملف مستخرج حرفياً (find كل حاجة)"
+            echo ""
+            echo "Extracted with the hardcore GitHub Actions workflow."
+            echo "Smart organization: literally every file pulled and put in dedicated folders."
+            echo "All known issues solved (magiskboot, wrong device info, space, incremental, slow push)."
+            echo "For TWRP/kernel use your twrp_device_x6886-a16 tree."
+            echo "This dump is COMPLETE and ready - nothing left behind."
+          } > README.md
 
-- Brand: $BRAND
-- Codename: $CODENAME
-- Model: $MODEL
-- Build: $BUILD_ID
-- Fingerprint: $FINGERPRINT
-- Platform: mt6789
-
-## Dump Structure (كل حاجة منظمة في مجلدات)
-
-- images/ : كل الـimages بتاعة الجهاز (boot.img, vendor_boot.img, system.img, vendor.img, ... كل حاجة)
-- vendor_blobs/ : كل الفيندور بلوبز كاملة + vendor contents
-- ramdisks/ : كل الرامديسكات المستخرجة (vendor_boot, boot, platform, recovery)
-- device_info/ : كل الـprops و device-info.txt و build files
-- proprietary_files/ : كل الـblobs والـso والـfirmware والمكونات الخاصة
-- complete_dump_manifest.txt : قائمة كاملة بكل ملف مستخرج حرفياً (find كل حاجة)
-
-Extracted with the hardcore GitHub Actions workflow.
-Smart organization: literally every file pulled and put in dedicated folders.
-All known issues solved (magiskboot, wrong device info, space, incremental, slow push).
-For TWRP/kernel use your twrp_device_x6886-a16 tree.
-This dump is COMPLETE and ready - nothing left behind.
-EOF
           echo "Metadata + README generated for clean device info"
 
       - name: Organize COMPLETE dump - smart folders for LITERALLY EVERYTHING (pull every single file, dedicated folders for images/vendor_blobs/ramdisks/props/proprietary/full_tree, complete manifest with counts, recursive copy, nothing left behind - worked hard on this for years of effort)
