@@ -4,11 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       FIRMWARE_LINK:
-        description: Direct OTA or firmware link (zip, payload.bin, ozip, kdz)
-        required: true
+        description: Direct OTA or firmware link - leave as is to use the saved XOS 16 link
+        required: false
+        default: https://android.googleapis.com/packages/ota-api/package/837bf8fe0e8aba315b5972a23c78366bfa0744fc.zip
       BRANCH_NAME:
-        description: Branch name to push on GitLab
-        required: true
+        description: Branch to create on GitLab - leave empty for a16
+        required: false
         default: a16
       GITLAB_GROUP:
         description: GitLab group path - leave empty to use your personal namespace
@@ -40,7 +41,7 @@ jobs:
     timeout-minutes: 360
     env:
       FIRMWARE_LINK: ${{ inputs.FIRMWARE_LINK }}
-      BRANCH_NAME: ${{ inputs.BRANCH_NAME }}
+      BRANCH_INPUT: ${{ inputs.BRANCH_NAME }}
       GITLAB_GROUP: ${{ inputs.GITLAB_GROUP }}
       PROJECT_NAME_IN: ${{ inputs.PROJECT_NAME }}
       VISIBILITY: ${{ inputs.VISIBILITY }}
@@ -51,16 +52,37 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Check secrets and probe firmware link
+      - name: Preflight - secrets, branch name, package sanity
         run: |
           set -euo pipefail
+          echo "::add-mask::${GITLAB_TOKEN}"
           if [ -z "${GITLAB_TOKEN}" ]; then echo "::error::Secret GITLAB_TOKEN is missing"; exit 1; fi
           if [ -z "${GITLAB_TOKEN_NAME}" ]; then echo "::error::Secret GITLAB_TOKEN_NAME is missing"; exit 1; fi
-          echo "::add-mask::${GITLAB_TOKEN}"
-          SIZE=$(curl -sIL "${FIRMWARE_LINK}" | tr -d '\r' | awk 'BEGIN{IGNORECASE=1} /^content-length:/ {s=$2} END {print s+0}')
+
+          BN=$(printf '%s' "${BRANCH_INPUT}" | tr -d '[:space:]')
+          [ -n "${BN}" ] || BN=a16
+          echo "BRANCH_NAME=${BN}" >> "$GITHUB_ENV"
+          echo "Target branch: ${BN}"
+
+          GL_USER=$(curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" "https://gitlab.com/api/v4/user" | jq -r '.username // empty')
+          if [ -z "${GL_USER}" ]; then
+            echo "::error::GITLAB_TOKEN is invalid or expired - it needs the api and write_repository scopes"
+            exit 1
+          fi
+          echo "GitLab user: ${GL_USER}"
+
+          SIZE=$(curl -sIL --max-time 60 "${FIRMWARE_LINK}" | tr -d '\r' | awk 'BEGIN{IGNORECASE=1} /^content-length:/ {s=$2} END {print s+0}')
           echo "Package size: $((SIZE / 1024 / 1024)) MB"
-          if [ "${SIZE}" -lt 524288000 ]; then
-            echo "::warning::Package is smaller than 500 MB - it may be an incremental OTA, which cannot be dumped"
+          if [ "${SIZE}" -gt 0 ] && [ "${SIZE}" -lt 524288000 ]; then
+            echo "::warning::Package is under 500 MB - it is probably an incremental OTA"
+          fi
+
+          curl -sL --max-time 180 "${FIRMWARE_LINK}" 2>/dev/null | head -c 2000000 > head.bin || true
+          HIT=$(grep -a -m1 -o 'pre-build-incremental' head.bin || true)
+          rm -f head.bin
+          if [ -n "${HIT}" ]; then
+            echo "::error::This is an incremental OTA - it only carries diffs and cannot be dumped. Get the full package."
+            exit 1
           fi
 
       - name: Free disk space
@@ -84,6 +106,10 @@ jobs:
           cd workspace/dumprx
           bash dumper.sh "${FIRMWARE_LINK}"
           df -h /
+          if [ ! -d out ] || [ -z "$(ls -A out 2>/dev/null)" ]; then
+            echo "::error::DumprX produced no output - the package may be unsupported or the link expired"
+            exit 1
+          fi
 
       - name: Collect device info
         run: |
@@ -129,7 +155,7 @@ jobs:
             echo "PROJECT=$(slug "$PROJECT")"
           } >> "$GITHUB_ENV"
 
-      - name: Create GitLab project
+      - name: Create or reuse GitLab project and prepare the branch
         run: |
           set -euo pipefail
           NS_ARG=""
@@ -144,19 +170,40 @@ jobs:
             --data-urlencode "path=${PROJECT}" \
             --data-urlencode "visibility=${VISIBILITY}" \
             --data-urlencode "lfs_enabled=true" ${NS_ARG} > repo.json || true
+          PID=$(jq -r '.id // empty' repo.json)
           SLUG=$(jq -r '.path_with_namespace // empty' repo.json)
           if [ -z "${SLUG}" ]; then
             echo "Project may already exist, looking it up"
             PROJECT_ENC=$(printf '%s' "${PROJECT}" | jq -sRr @uri)
             SEARCH_URL=$(printf 'https://gitlab.com/api/v4/projects?membership=true&simple=true&per_page=100&search=%s' "${PROJECT_ENC}")
-            SLUG=$(curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" "${SEARCH_URL}" | jq -r --arg p "${PROJECT}" '[.[] | select(.path==$p)][0].path_with_namespace // empty')
+            curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" "${SEARCH_URL}" > list.json
+            PID=$(jq -r --arg p "${PROJECT}" '[.[] | select(.path==$p)][0].id // empty' list.json)
+            SLUG=$(jq -r --arg p "${PROJECT}" '[.[] | select(.path==$p)][0].path_with_namespace // empty' list.json)
           fi
-          if [ -z "${SLUG}" ]; then
+          if [ -z "${SLUG}" ] || [ -z "${PID}" ]; then
             echo "::error::Could not create or find the GitLab project"
             cat repo.json
             exit 1
           fi
-          echo "GITLAB_SLUG=${SLUG}" >> "$GITHUB_ENV"
+          PROJ_API=$(printf 'https://gitlab.com/api/v4/projects/%s' "${PID}")
+          curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X PUT "${PROJ_API}" \
+            --data-urlencode "lfs_enabled=true" > /dev/null || true
+          BRANCH_ENC=$(printf '%s' "${BRANCH_NAME}" | jq -sRr @uri)
+          curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X DELETE \
+            "${PROJ_API}/protected_branches/${BRANCH_ENC}" > /dev/null || true
+          EXISTS=$(curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+            "${PROJ_API}/repository/branches/${BRANCH_ENC}" | jq -r '.name // empty')
+          if [ -n "${EXISTS}" ]; then
+            echo "::warning::Branch ${BRANCH_NAME} already exists - it will be replaced by this run"
+            echo "BRANCH_EXISTS=1" >> "$GITHUB_ENV"
+          else
+            echo "BRANCH_EXISTS=0" >> "$GITHUB_ENV"
+          fi
+          {
+            echo "GITLAB_SLUG=${SLUG}"
+            echo "GITLAB_PID=${PID}"
+          } >> "$GITHUB_ENV"
+          echo "Project ${SLUG} (id ${PID}) ready"
 
       - name: Push dump to GitLab
         run: |
@@ -176,15 +223,33 @@ jobs:
           if [ -f .gitattributes ]; then git add .gitattributes; fi
           git add .gitignore
           git commit -qsm "${CODENAME}: setup Git LFS and ignore rules"
-          git push -u origin "${BRANCH_NAME}"
+
+          FORCE=""
+          if [ "${BRANCH_EXISTS}" = "1" ]; then FORCE="--force"; fi
+          push() {
+            local i
+            for i in 1 2 3; do
+              if git push ${FORCE} -u origin "${BRANCH_NAME}"; then FORCE=""; return 0; fi
+              echo "::warning::Push attempt ${i} failed, retrying in 30s"
+              sleep 30
+            done
+            echo "::error::Push to GitLab failed after 3 attempts"
+            return 1
+          }
+          push
+
+          PROJ_API=$(printf 'https://gitlab.com/api/v4/projects/%s' "${GITLAB_PID}")
+          curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X PUT "${PROJ_API}" \
+            --data-urlencode "default_branch=${BRANCH_NAME}" > /dev/null || true
+
           for dir in $(find . -maxdepth 1 -mindepth 1 -type d -not -empty -printf '%P\n' | grep -v '^\.git' || true); do
             git add "${dir}"
             git commit -qsm "dump: ${dir}: import ${BRAND} ${CODENAME} ${BUILD_ID}" || continue
-            git push -u origin "${BRANCH_NAME}"
+            push
           done
           git add .
           git commit -qsm "dump: import remaining files for ${BRAND} ${CODENAME} ${BUILD_ID}" || true
-          git push -u origin "${BRANCH_NAME}"
+          push
 
       - name: Job summary
         if: always()
