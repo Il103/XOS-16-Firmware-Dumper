@@ -12,9 +12,9 @@ on:
         required: false
         default: a16
       GITLAB_GROUP:
-        description: GitLab group path - leave empty to use your personal namespace
+        description: GitLab group path - use 'Il103-group' for the Ultimate trial (recommended - more storage + better LFS for large ~10GB+ dumps)
         required: false
-        default: ''
+        default: 'Il103-group'
       PROJECT_NAME:
         description: GitLab project name - leave empty for android_dump_brand_codename
         required: false
