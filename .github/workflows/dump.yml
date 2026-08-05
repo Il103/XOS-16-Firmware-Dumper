@@ -1,3 +1,15 @@
+# ================================================
+# CRITICAL FIX FOR workflow_dispatch
+# The file MUST have this EXACT trigger at the TOP LEVEL so the "Run workflow" button appears.
+# If no button shows:
+# 1. Delete the current .github/workflows/dump.yml file completely from the repo
+# 2. Create new file at exactly .github/workflows/dump.yml
+# 3. Paste EVERYTHING below (starting from this comment block all the way to the end of the YAML)
+# 4. Commit directly to main
+# 5. Go to Actions tab and HARD REFRESH (Ctrl+Shift+R)
+# The green "Run workflow" button will appear.
+# ================================================
+
 name: Firmware Dump to GitLab
 
 on:
