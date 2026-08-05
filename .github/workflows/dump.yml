@@ -1,0 +1,204 @@
+name: Firmware Dump to GitLab
+
+on:
+  workflow_dispatch:
+    inputs:
+      FIRMWARE_LINK:
+        description: Direct OTA or firmware link (zip, payload.bin, ozip, kdz)
+        required: true
+      BRANCH_NAME:
+        description: Branch name to push on GitLab
+        required: true
+        default: a16
+      GITLAB_GROUP:
+        description: GitLab group path - leave empty to use your personal namespace
+        required: false
+        default: ''
+      PROJECT_NAME:
+        description: GitLab project name - leave empty for android_dump_brand_codename
+        required: false
+        default: ''
+      VISIBILITY:
+        description: GitLab project visibility
+        required: false
+        default: public
+        type: choice
+        options:
+          - public
+          - private
+          - internal
+
+concurrency:
+  group: firmware-dump
+  cancel-in-progress: false
+
+jobs:
+  dump:
+    name: Dump by ${{ github.actor }}
+    runs-on: ubuntu-latest
+    if: github.event.repository.owner.id == github.event.sender.id
+    timeout-minutes: 360
+    env:
+      FIRMWARE_LINK: ${{ inputs.FIRMWARE_LINK }}
+      BRANCH_NAME: ${{ inputs.BRANCH_NAME }}
+      GITLAB_GROUP: ${{ inputs.GITLAB_GROUP }}
+      PROJECT_NAME_IN: ${{ inputs.PROJECT_NAME }}
+      VISIBILITY: ${{ inputs.VISIBILITY }}
+      GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+      GITLAB_TOKEN_NAME: ${{ secrets.GITLAB_TOKEN_NAME }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check secrets and probe firmware link
+        run: |
+          set -euo pipefail
+          if [ -z "${GITLAB_TOKEN}" ]; then echo "::error::Secret GITLAB_TOKEN is missing"; exit 1; fi
+          if [ -z "${GITLAB_TOKEN_NAME}" ]; then echo "::error::Secret GITLAB_TOKEN_NAME is missing"; exit 1; fi
+          echo "::add-mask::${GITLAB_TOKEN}"
+          SIZE=$(curl -sIL "${FIRMWARE_LINK}" | tr -d '\r' | awk 'BEGIN{IGNORECASE=1} /^content-length:/ {s=$2} END {print s+0}')
+          echo "Package size: $((SIZE / 1024 / 1024)) MB"
+          if [ "${SIZE}" -lt 524288000 ]; then
+            echo "::warning::Package is smaller than 500 MB - it may be an incremental OTA, which cannot be dumped"
+          fi
+
+      - name: Free disk space
+        uses: rokibhasansagar/slimhub_actions@main
+
+      - name: Set swap space
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 12
+
+      - name: Setup DumprX
+        run: |
+          set -euo pipefail
+          mkdir -p workspace && cd workspace
+          git clone -q --depth=1 https://github.com/DumprX/DumprX.git dumprx
+          cd dumprx && bash setup.sh
+
+      - name: Dump firmware
+        run: |
+          set -euo pipefail
+          cd workspace/dumprx
+          bash dumper.sh "${FIRMWARE_LINK}"
+          df -h /
+
+      - name: Collect device info
+        run: |
+          set -euo pipefail
+          cd workspace/dumprx/out
+          getp() {
+            local key="$1"; shift
+            local f v=""
+            for f in "$@"; do
+              [ -f "$f" ] || continue
+              v=$(grep -m1 "^${key}=" "$f" 2>/dev/null | cut -d= -f2- | tr -d '\r' || true)
+              if [ -n "$v" ]; then break; fi
+            done
+            printf '%s' "${v%% *}"
+          }
+          slug() {
+            printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_.-' '_' | sed 's/__*/_/g; s/^_//; s/_$//'
+          }
+          PROPS="vendor/build.prop system/system/build.prop system/build.prop odm/etc/build.prop"
+          BRAND=$(getp ro.product.vendor.manufacturer $PROPS)
+          [ -n "$BRAND" ] || BRAND=$(getp ro.product.system.manufacturer $PROPS)
+          [ -n "$BRAND" ] || BRAND=unknown
+          CODENAME=$(getp ro.product.vendor.device $PROPS)
+          [ -n "$CODENAME" ] || CODENAME=$(getp ro.product.device $PROPS)
+          [ -n "$CODENAME" ] || CODENAME=device
+          if [ "$BRAND" = "oplus" ]; then
+            mkdir -p odm
+            if [ ! -f odm/build.prop ]; then
+              echo "ro.vendor.oplus.market.name=ossi-${GITHUB_RUN_ID}" > odm/build.prop
+            fi
+            OPLUS_NAME=$(getp ro.vendor.oplus.market.name odm/build.prop)
+            if [ -n "$OPLUS_NAME" ]; then CODENAME="$OPLUS_NAME"; fi
+          fi
+          BUILD_ID=$(getp ro.vendor.build.id $PROPS)
+          FINGERPRINT=$(getp ro.vendor.build.fingerprint $PROPS)
+          PROJECT="${PROJECT_NAME_IN}"
+          [ -n "$PROJECT" ] || PROJECT="android_dump_${BRAND}_${CODENAME}"
+          {
+            echo "BRAND=$(slug "$BRAND")"
+            echo "CODENAME=$(slug "$CODENAME")"
+            echo "BUILD_ID=${BUILD_ID:-unknown}"
+            echo "FINGERPRINT=${FINGERPRINT:-unknown}"
+            echo "PROJECT=$(slug "$PROJECT")"
+          } >> "$GITHUB_ENV"
+
+      - name: Create GitLab project
+        run: |
+          set -euo pipefail
+          NS_ARG=""
+          if [ -n "${GITLAB_GROUP}" ]; then
+            GROUP_ENC=$(printf '%s' "${GITLAB_GROUP}" | jq -sRr @uri)
+            GROUP_URL=$(printf 'https://gitlab.com/api/v4/groups/%s' "${GROUP_ENC}")
+            NS_ID=$(curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" "${GROUP_URL}" | jq -r '.id // empty')
+            if [ -n "${NS_ID}" ]; then NS_ARG="--data-urlencode namespace_id=${NS_ID}"; fi
+          fi
+          curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X POST "https://gitlab.com/api/v4/projects" \
+            --data-urlencode "name=${PROJECT}" \
+            --data-urlencode "path=${PROJECT}" \
+            --data-urlencode "visibility=${VISIBILITY}" \
+            --data-urlencode "lfs_enabled=true" ${NS_ARG} > repo.json || true
+          SLUG=$(jq -r '.path_with_namespace // empty' repo.json)
+          if [ -z "${SLUG}" ]; then
+            echo "Project may already exist, looking it up"
+            PROJECT_ENC=$(printf '%s' "${PROJECT}" | jq -sRr @uri)
+            SEARCH_URL=$(printf 'https://gitlab.com/api/v4/projects?membership=true&simple=true&per_page=100&search=%s' "${PROJECT_ENC}")
+            SLUG=$(curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" "${SEARCH_URL}" | jq -r --arg p "${PROJECT}" '[.[] | select(.path==$p)][0].path_with_namespace // empty')
+          fi
+          if [ -z "${SLUG}" ]; then
+            echo "::error::Could not create or find the GitLab project"
+            cat repo.json
+            exit 1
+          fi
+          echo "GITLAB_SLUG=${SLUG}" >> "$GITHUB_ENV"
+
+      - name: Push dump to GitLab
+        run: |
+          set -euo pipefail
+          cd workspace/dumprx/out
+          rm -rf .git .gitignore .gitattributes
+          git init -q -b "${BRANCH_NAME}"
+          git lfs install --local
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
+          git config http.version HTTP/1.1
+          git config http.postBuffer 524288000
+          find . \( -name "*sensetime*" -o -name "*.lic" \) | cut -d'/' -f2- > .gitignore || true
+          REMOTE_URL=$(printf 'https://%s:%s@gitlab.com/%s.git' "${GITLAB_TOKEN_NAME}" "${GITLAB_TOKEN}" "${GITLAB_SLUG}")
+          git remote add origin "${REMOTE_URL}"
+          find . -type f -size +100M -not -path "./.git/*" -exec git lfs track {} +
+          if [ -f .gitattributes ]; then git add .gitattributes; fi
+          git add .gitignore
+          git commit -qsm "${CODENAME}: setup Git LFS and ignore rules"
+          git push -u origin "${BRANCH_NAME}"
+          for dir in $(find . -maxdepth 1 -mindepth 1 -type d -not -empty -printf '%P\n' | grep -v '^\.git' || true); do
+            git add "${dir}"
+            git commit -qsm "dump: ${dir}: import ${BRAND} ${CODENAME} ${BUILD_ID}" || continue
+            git push -u origin "${BRANCH_NAME}"
+          done
+          git add .
+          git commit -qsm "dump: import remaining files for ${BRAND} ${CODENAME} ${BUILD_ID}" || true
+          git push -u origin "${BRANCH_NAME}"
+
+      - name: Job summary
+        if: always()
+        run: |
+          PROJECT_URL=$(printf 'https://gitlab.com/%s' "${GITLAB_SLUG:-}")
+          {
+            echo "### Firmware dump"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Brand | ${BRAND:-unknown} |"
+            echo "| Codename | ${CODENAME:-unknown} |"
+            echo "| Build ID | ${BUILD_ID:-unknown} |"
+            echo "| Fingerprint | ${FINGERPRINT:-unknown} |"
+            echo "| Branch | ${BRANCH_NAME} |"
+            echo "| GitLab | ${PROJECT_URL} |"
+          } >> "$GITHUB_STEP_SUMMARY"
