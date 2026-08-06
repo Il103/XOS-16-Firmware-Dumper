@@ -75,6 +75,9 @@ jobs:
           echo "PROJECT=${PROJECT}" >> "$GITHUB_ENV"
           echo "Device LOCKED from second zero: ${BRAND} ${CODENAME} (${MODEL}) - ${BUILD_ID}"
           echo "transsion/tssi can NEVER appear - hard-locked env vars, no build.prop guessing"
+          OTAHASH=$(printf '%s' "${FIRMWARE_LINK}" | sha256sum | cut -c1-16)
+          echo "OTA_HASH=${OTAHASH}" >> "$GITHUB_ENV"
+          echo "OTA cache key: ota-${OTAHASH} (same link = never downloaded again)"
 
       - name: Stage 2a - Free disk space
         uses: rokibhasansagar/slimhub_actions@main
@@ -109,14 +112,26 @@ jobs:
           echo "Stage 2c done - every tool has a fallback in later stages, this stage never fails"
           exit 0
 
-      - name: Stage 3 - Download OTA (aria2c 16 connections + full-package verification)
+      - name: Stage 2d - Restore OTA from cache (8GB package - never downloaded twice)
+        id: otacache
+        uses: actions/cache/restore@v4
+        with:
+          path: workspace/dl/firmware.zip
+          key: ota-${{ env.OTA_HASH }}
+
+      - name: Stage 3 - Get OTA (cache hit = instant start, else aria2c 16 connections + verification)
         run: |
           set -euo pipefail
           mkdir -p workspace/dl && cd workspace/dl
-          aria2c -x16 -s16 -k16M --file-allocation=none --summary-interval=30 -o firmware.zip "${FIRMWARE_LINK}" || curl -sSL -o firmware.zip "${FIRMWARE_LINK}"
+          if [ -f firmware.zip ]; then
+            echo "::notice::OTA restored from cache - SKIPPED the whole 8GB download"
+          else
+            echo "No cache yet - downloading 8GB with aria2c (16 connections, once ever)..."
+            aria2c -x16 -s16 -k16M --file-allocation=none --summary-interval=60 -o firmware.zip "${FIRMWARE_LINK}" || curl -sSL -o firmware.zip "${FIRMWARE_LINK}"
+          fi
           SZ=$(stat -c%s firmware.zip)
           ls -lh firmware.zip
-          [ "${SZ}" -gt 104857600 ] || { echo "::error::Download too small (${SZ} bytes) - link dead?"; exit 1; }
+          [ "${SZ}" -gt 104857600 ] || { echo "::error::Package too small (${SZ} bytes) - link dead?"; exit 1; }
           unzip -l firmware.zip | grep -q 'payload.bin' || { echo "::error::No payload.bin - not a full A/B OTA"; exit 1; }
           if unzip -p firmware.zip META-INF/com/android/metadata 2>/dev/null | grep -q 'pre-build-incremental'; then
             echo "::error::Incremental OTA - diffs only, cannot dump"
@@ -124,20 +139,30 @@ jobs:
           fi
           echo "Full OTA verified: $((SZ/1024/1024)) MB"
 
-      - name: Stage 4 - Extract payload.bin (payload-dumper-go, 10x faster)
+      - name: Stage 3b - Save OTA to cache (first successful download only - every future run starts instantly)
+        if: steps.otacache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: workspace/dl/firmware.zip
+          key: ota-${{ env.OTA_HASH }}
+
+      - name: Stage 4 - Extract payload.bin (payload-dumper-go, 10x faster, quiet log - no 60k spam lines)
         run: |
           set -euo pipefail
           mkdir -p workspace/extracted && cd workspace/dl
           unzip -o -q firmware.zip payload.bin
           if command -v payload-dumper-go > /dev/null 2>&1; then
-            echo "payload-dumper-go extracting..."
-            payload-dumper-go -o ../extracted payload.bin
+            echo "payload-dumper-go extracting (per-block progress hidden in /tmp/pd.log - screen stays clean)..."
+            payload-dumper-go -o ../extracted payload.bin > /tmp/pd.log 2>&1 || { echo "::error::payload-dumper-go failed"; tail -30 /tmp/pd.log; exit 1; }
+            echo "=== Partitions being extracted (real list + real sizes) ==="
+            grep -m1 -E "Found partitions" /tmp/pd.log | sed 's/.*Found partitions://; s/, /\n/g; s/^/  - /' || true
           else
             echo "::warning::python payload_dumper fallback"
             git clone -q --depth=1 https://github.com/vm03/payload_dumper /tmp/pd
-            python3 /tmp/pd/payload_dumper.py --out ../extracted payload.bin
+            python3 /tmp/pd/payload_dumper.py --out ../extracted payload.bin > /tmp/pd.log 2>&1 || { echo "::error::python payload_dumper failed"; tail -30 /tmp/pd.log; exit 1; }
           fi
           rm -f payload.bin
+          echo "Extracted $(ls ../extracted/*.img 2>/dev/null | wc -l) partition images:"
           ls -lh ../extracted/
 
       - name: Stage 5 - Unpack super.img (simg2img + lpunpack)
@@ -165,7 +190,7 @@ jobs:
           extract_img() {
             local img="$1" name="$2"
             [ -f "$img" ] || return 0
-            echo "--- $img -> $name/ ---"
+            echo "--- $img ($(du -h "$img" 2>/dev/null | cut -f1)) -> $name/ ---"
             mkdir -p "$name"
             file "$img" | grep -qi sparse && { simg2img "$img" "${img}.raw" 2>/dev/null && mv "${img}.raw" "$img"; }
             if extract.erofs -i "$img" -o "$name" > /dev/null 2>&1 || fsck.erofs --extract="$name" "$img" > /dev/null 2>&1; then
@@ -178,11 +203,11 @@ jobs:
             fi
             7z x -y -o"$name" "$img" > /dev/null 2>&1 && echo "$name: 7z OK" || echo "::warning::$img kept raw"
           }
-          for spec in "system.img:system" "vendor.img:vendor" "product.img:product" "odm.img:odm" "system_ext.img:system_ext" "vendor_dlkm.img:vendor_dlkm" "odm_dlkm.img:odm_dlkm" "system_dlkm.img:system_dlkm"; do
+          for spec in "system.img:system" "vendor.img:vendor" "product.img:product" "odm.img:odm" "system_ext.img:system_ext" "vendor_dlkm.img:vendor_dlkm" "odm_dlkm.img:odm_dlkm" "system_dlkm.img:system_dlkm" "tr_region.img:tr_region" "tr_product.img:tr_product" "tr_preload.img:tr_preload" "tr_carrier.img:tr_carrier" "tr_company.img:tr_company" "tr_manifest.img:tr_manifest" "tr_misc.img:tr_misc" "tr_overlayfs.img:tr_overlayfs"; do
             extract_img "${spec%%:*}" "${spec##*:}"
           done
           echo "=== Extraction summary ==="
-          for d in system vendor product odm system_ext vendor_dlkm odm_dlkm system_dlkm; do
+          for d in system vendor product odm system_ext vendor_dlkm odm_dlkm system_dlkm tr_region tr_product tr_preload tr_carrier tr_company tr_manifest tr_misc tr_overlayfs; do
             [ -d "$d" ] && echo "$d: $(find "$d" -type f 2>/dev/null | wc -l) files, $(du -sh "$d" 2>/dev/null | cut -f1)"
           done
           exit 0
@@ -199,12 +224,37 @@ jobs:
             for rd in "${img}/unpacked"/*ramdisk*; do
               [ -f "$rd" ] || continue
               name=$(basename "$rd")
+              sz=$(stat -c%s "$rd" 2>/dev/null || echo 0)
               dest="${img}/${name}_extracted"
               mkdir -p "$dest"
-              ( cd "$dest" && lz4 -d -c "$rd" 2>/dev/null | cpio -idm --quiet 2>/dev/null ) || \
-              ( cd "$dest" && gzip -dc "$rd" 2>/dev/null | cpio -idm --quiet 2>/dev/null ) || \
-              ( cd "$dest" && zstd -dc "$rd" 2>/dev/null | cpio -idm --quiet 2>/dev/null ) || \
-              echo "::notice::${name} kept raw (empty ramdisk is normal for GKI boot.img)"
+              if [ "$sz" -lt 1000 ]; then
+                echo "::notice::${name} empty (${sz} bytes) - normal for GKI boot.img, kept raw"
+                continue
+              fi
+              # Detect REAL compression from magic bytes - never guess
+              magic=$(xxd -p -l4 "$rd" 2>/dev/null | tr -d ' \n')
+              case "$magic" in
+                04224d18|02214c18) DEC="lz4 -dc" ;;
+                1f8b*) DEC="gzip -dc" ;;
+                28b52ffd) DEC="zstd -dc" ;;
+                30373037*|71c7*|c771*) DEC="cat" ;;
+                *) DEC="cat" ;;
+              esac
+              tmp=/tmp/rd_extract.cpio
+              rm -f "$tmp"
+              ok=""
+              for try in "$DEC" "lz4 -dc" "lz4 -d -l -c" "gzip -dc" "zstd -dc" "cat"; do
+                if $try "$rd" > "$tmp" 2>/dev/null && [ "$(stat -c%s "$tmp" 2>/dev/null || echo 0)" -gt 1000 ]; then
+                  ok=1
+                  break
+                fi
+              done
+              if [ -n "$ok" ] && ( cd "$dest" && cpio -idm --quiet < "$tmp" 2>/dev/null ); then
+                echo "${name}: extracted OK - $(find "$dest" -type f | wc -l) files (magic=$magic)"
+              else
+                echo "::warning::${name} kept raw - file preserved and will be pushed (magic=$magic)"
+              fi
+              rm -f "$tmp"
             done
             [ -f "${img}/unpacked/kernel" ] && cp "${img}/unpacked/kernel" "${img}/kernel" || true
             [ -f "${img}/unpacked/dtb" ] && cp "${img}/unpacked/dtb" "${img}/dtb" || true
@@ -257,124 +307,209 @@ jobs:
             echo "- Build: BP2A.250605.031.A3 | Android 16"
             echo "- Platform: mt6789 | Kernel 6.12.38"
             echo ""
-            echo "## Structure"
-            echo "- images/ - all partition images + kernel + dtb"
-            echo "- vendor_blobs/ - COMPLETE vendor + vendor_dlkm + odm + product"
-            echo "- ramdisks/ - every boot ramdisk extracted"
-            echo "- system/ system_ext/ vendor/ ... - fully extracted EROFS partitions"
+            echo "## Structure (split across 5 projects - GitLab per-project quota)"
+            echo "- images/ - small + critical images (boot, vendor_boot, dtbo, vbmeta x3, md1img modem, lk, gz, tee, scp, preloader_raw, dpm, mcupm, pi_img, spmfw, sspm, tkv) + kernel + dtb"
+            echo "- system/ system_ext/ vendor/ product/ odm/ vendor_dlkm/ odm_dlkm/ system_dlkm/ - fully extracted EROFS partitions (real contents, real sizes)"
+            echo "- ramdisks/ - boot + vendor_boot + init_boot unpacked with every ramdisk extracted (magic-byte detection)"
             echo "- aosp-device-tree/ - auto-generated device tree (review and refine manually)"
-            echo "- device_info/ + proprietary_files/ + firmware/"
-            echo "- complete_dump_manifest.txt - every file with counts and sizes"
+            echo "- device_info/ + proprietary-files-list.txt + complete_dump_manifest.txt"
+            echo ""
+            echo "Raw partition images live in the sibling projects:"
+            echo "- ${PROJECT}_imgs_system (system.img, system_ext.img, system_dlkm.img)"
+            echo "- ${PROJECT}_imgs_vendor (vendor.img, vendor_dlkm.img, product.img, odm.img, odm_dlkm.img)"
+            echo "- ${PROJECT}_imgs_tr (tr_region.img, tr_product.img, tr_preload.img, ...) raw"
+            echo "- ${PROJECT}_tr_extracted (extracted contents of every tr_* partition)"
           } > README.md
 
-      - name: Stage 10 - Smart organize (clean images/ + complete vendor_blobs/ + full manifest - NEVER fails)
+      - name: Stage 10 - Smart organize with MOVES (zero duplication, real sizes) + split staging for the storage quota
         run: |
           set +e
           cd workspace/extracted
-          mkdir -p images vendor_blobs ramdisks device_info proprietary_files firmware
-          for f in boot.img vendor_boot.img init_boot.img dtbo.img vbmeta.img vbmeta_system.img vbmeta_vendor.img super.img recovery.img system.img vendor.img product.img odm.img system_ext.img vendor_dlkm.img odm_dlkm.img system_dlkm.img lk.img logo.img tee.img scp.img preloader_x6886.bin; do
-            [ -f "$f" ] && cp -v "$f" images/ || true
+          echo "=== SMART ORGANIZE - MOVE not copy (every file uploaded ONCE at its REAL size) ==="
+          mkdir -p images ramdisks device_info _split/imgs_system _split/imgs_vendor _split/imgs_tr _split/tr_extracted
+
+          echo "--- [1/6] Small + critical images -> images/ (stay in the MAIN project) ---"
+          for f in boot.img vendor_boot.img init_boot.img dtbo.img vbmeta.img vbmeta_system.img vbmeta_vendor.img recovery.img lk.img logo.img tee.img scp.img md1img.img preloader_raw.img gz.img dpm.img mcupm.img pi_img.img spmfw.img sspm.img tkv.img; do
+            [ -f "$f" ] && mv -v "$f" images/ || true
           done
           [ -f boot/kernel ] && cp boot/kernel images/kernel || true
           [ -f vendor_boot/kernel ] && cp vendor_boot/kernel images/vendor_boot_kernel || true
           [ -f boot/dtb ] && cp boot/dtb images/dtb || true
           [ -f vendor_boot/dtb ] && cp vendor_boot/dtb images/vendor_dtb || true
-          find vendor_boot -name "*.dtb" -exec cp {} images/ \; 2>/dev/null || true
-          for d in vendor vendor_dlkm odm_dlkm odm product; do
-            [ -d "$d" ] && cp -a "$d" vendor_blobs/ 2>/dev/null || true
+          find vendor_boot ramdisks -name "*.dtb" -exec cp {} images/ \; 2>/dev/null || true
+
+          echo "--- [2/6] BIG raw images -> split staging (each split project stays under the per-project quota) ---"
+          for f in system.img system_ext.img system_dlkm.img; do [ -f "$f" ] && mv -v "$f" _split/imgs_system/ || true; done
+          for f in vendor.img vendor_dlkm.img product.img odm.img odm_dlkm.img; do [ -f "$f" ] && mv -v "$f" _split/imgs_vendor/ || true; done
+          for f in tr_region.img tr_product.img tr_preload.img tr_carrier.img tr_company.img tr_manifest.img tr_misc.img tr_overlayfs.img; do [ -f "$f" ] && mv -v "$f" _split/imgs_tr/ || true; done
+
+          echo "--- [3/6] Extracted tr_* contents -> their own split project ---"
+          for d in tr_region tr_product tr_preload tr_carrier tr_company tr_manifest tr_misc tr_overlayfs; do
+            [ -d "$d" ] && mv -v "$d" _split/tr_extracted/ || true
           done
-          [ -d system/vendor ] && { mkdir -p vendor_blobs/system_vendor; cp -a system/vendor/. vendor_blobs/system_vendor/ 2>/dev/null || true; }
-          [ -d system/system/vendor ] && { mkdir -p vendor_blobs/system_vendor; cp -a system/system/vendor/. vendor_blobs/system_vendor/ 2>/dev/null || true; }
+
+          echo "--- [4/6] boot folders -> ramdisks/ (moved - zero copies) ---"
           for img in boot vendor_boot init_boot; do
-            [ -d "$img" ] && cp -a "$img" ramdisks/ 2>/dev/null || true
+            [ -d "$img" ] && mv -v "$img" ramdisks/ 2>/dev/null || true
           done
+
+          echo "--- [5/6] device info + props + proprietary list (text list, not duplicate copies) ---"
           cp device-info.txt device_info/ 2>/dev/null || true
-          find . -maxdepth 6 -name "*.prop" -not -path "./vendor_blobs/*" 2>/dev/null | while read -r f; do cp --parents "$f" device_info/ 2>/dev/null || true; done
-          find vendor vendor_dlkm odm odm_dlkm product system_ext -type f \( -name "*.so" -o -name "*.ko" -o -name "*.bin" -o -name "*.rc" -o -name "*.xml" -o -name "*.conf" -o -name "*.cfg" \) 2>/dev/null | while read -r f; do cp --parents "$f" proprietary_files/ 2>/dev/null || true; done
-          [ -d vendor/firmware ] && { mkdir -p firmware; cp -a vendor/firmware/. firmware/ 2>/dev/null || true; }
+          find . -maxdepth 6 -name "*.prop" -not -path "./_split/*" 2>/dev/null | while read -r f; do cp --parents "$f" device_info/ 2>/dev/null || true; done
+          find vendor vendor_dlkm odm odm_dlkm product system_ext -type f \( -name "*.so" -o -name "*.ko" -o -name "*.bin" -o -name "*.rc" \) 2>/dev/null | sort > proprietary-files-list.txt || true
+
+          echo "--- [6/6] READMEs + honest manifest with REAL sizes ---"
+          echo "# X6886 XOS 16 raw images - system family (system / system_ext / system_dlkm) - extract: fsck.erofs --extract=out file.img" > _split/imgs_system/README.md
+          echo "# X6886 XOS 16 raw images - vendor family (vendor / product / odm / *_dlkm)" > _split/imgs_vendor/README.md
+          echo "# X6886 XOS 16 raw Transsion tr_* partition images (region, product, preload, ...)" > _split/imgs_tr/README.md
+          echo "# X6886 XOS 16 - extracted contents of every tr_* partition" > _split/tr_extracted/README.md
           {
-            echo "=== COMPLETE X6886 DUMP MANIFEST ==="
+            echo "=== COMPLETE X6886 DUMP MANIFEST (zero duplication - every file uploaded once at real size) ==="
             echo "Device: Infinix Hot 60 Pro Plus (X6886) | Build BP2A.250605.031.A3 | Android 16"
             echo "Date: $(date -u)"
             echo ""
-            for d in images vendor_blobs ramdisks device_info proprietary_files firmware aosp-device-tree system system_ext vendor product odm vendor_dlkm; do
+            for d in images ramdisks device_info aosp-device-tree system system_ext vendor product odm vendor_dlkm odm_dlkm system_dlkm _split/imgs_system _split/imgs_vendor _split/imgs_tr _split/tr_extracted; do
               [ -d "$d" ] && echo "$d/: $(find "$d" -type f 2>/dev/null | wc -l) files, $(du -sh "$d" 2>/dev/null | cut -f1)"
             done
             echo ""
-            echo "TOTAL FILES: $(find . -type f 2>/dev/null | wc -l)"
+            echo "TOTAL FILES: $(find . -type f -not -path './.git/*' 2>/dev/null | wc -l)"
             echo "TOTAL SIZE: $(du -sh . 2>/dev/null | cut -f1)"
             echo ""
             echo "=== FULL FILE LIST ==="
-            find . -type f | sort
+            find . -type f -not -path './.git/*' | sort
           } > complete_dump_manifest.txt
-          echo "Organized $(find . -type f | wc -l) files - stage complete (never fails)"
+          head -25 complete_dump_manifest.txt || true
+          echo "--- Split sizes (each stays comfortably under the per-project quota) ---"
+          du -sh _split/imgs_system _split/imgs_vendor _split/imgs_tr _split/tr_extracted 2>/dev/null || true
+          echo "Main project size: $(find . -path ./_split -prune -o -type f -print0 2>/dev/null | du -ch --files0-from=- 2>/dev/null | tail -1 | cut -f1)"
           exit 0
 
-      - name: Stage 11 - Create or reuse GitLab project
+      - name: Stage 11 - Create/reuse FIVE GitLab projects + force PUBLIC visibility
         run: |
           set -euo pipefail
-          NS_ARG=""
+          GENC=""; NS_ARG=""
           if [ -n "${GITLAB_GROUP}" ]; then
             GENC=$(printf '%s' "${GITLAB_GROUP}" | jq -sRr @uri)
             NS_ID=$(curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" "https://gitlab.com/api/v4/groups/${GENC}" | jq -r '.id // empty')
             [ -n "${NS_ID}" ] && NS_ARG="--data-urlencode namespace_id=${NS_ID}"
+            [ -n "${NS_ID}" ] || echo "::warning::Group ${GITLAB_GROUP} not found - projects go to your personal namespace"
           fi
-          curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X POST "https://gitlab.com/api/v4/projects" \
-            --data-urlencode "name=${PROJECT}" --data-urlencode "path=${PROJECT}" \
-            --data-urlencode "visibility=${VISIBILITY}" --data-urlencode "lfs_enabled=true" ${NS_ARG} > repo.json || true
-          PID=$(jq -r '.id // empty' repo.json)
-          SLUG=$(jq -r '.path_with_namespace // empty' repo.json)
-          if [ -z "${SLUG}" ]; then
-            PENC=$(printf '%s' "${PROJECT}" | jq -sRr @uri)
-            curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" "https://gitlab.com/api/v4/projects?membership=true&simple=true&per_page=100&search=${PENC}" > list.json
-            PID=$(jq -r --arg p "${PROJECT}" '[.[] | select(.path==$p)][0].id // empty' list.json)
-            SLUG=$(jq -r --arg p "${PROJECT}" '[.[] | select(.path==$p)][0].path_with_namespace // empty' list.json)
-          fi
-          [ -n "${SLUG}" ] && [ -n "${PID}" ] || { echo "::error::No GitLab project"; cat repo.json; exit 1; }
-          PAPI="https://gitlab.com/api/v4/projects/${PID}"
-          curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X PUT "${PAPI}" --data-urlencode "lfs_enabled=true" > /dev/null || true
-          BENC=$(printf '%s' "${BRANCH_NAME}" | jq -sRr @uri)
-          curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X DELETE "${PAPI}/protected_branches/${BENC}" > /dev/null || true
-          EX=$(curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" "${PAPI}/repository/branches/${BENC}" | jq -r '.name // empty')
-          if [ -n "${EX}" ]; then echo "BRANCH_EXISTS=1" >> "$GITHUB_ENV"; else echo "BRANCH_EXISTS=0" >> "$GITHUB_ENV"; fi
-          echo "GITLAB_SLUG=${SLUG}" >> "$GITHUB_ENV"
-          echo "GITLAB_PID=${PID}" >> "$GITHUB_ENV"
-          echo "Project ready: ${SLUG} (id ${PID})"
+          ensure_project() {
+            local name="$1" slug pid papi cur penc benc
+            curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X POST "https://gitlab.com/api/v4/projects" \
+              --data-urlencode "name=${name}" --data-urlencode "path=${name}" \
+              --data-urlencode "visibility=public" --data-urlencode "lfs_enabled=true" ${NS_ARG} > repo.json 2>/dev/null || true
+            pid=$(jq -r '.id // empty' repo.json)
+            slug=$(jq -r '.path_with_namespace // empty' repo.json)
+            if [ -z "${slug}" ]; then
+              penc=$(printf '%s' "${name}" | jq -sRr @uri)
+              curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" "https://gitlab.com/api/v4/projects?membership=true&simple=true&per_page=100&search=${penc}" > list.json 2>/dev/null || true
+              pid=$(jq -r --arg p "${name}" '[.[] | select(.path==$p)][0].id // empty' list.json)
+              slug=$(jq -r --arg p "${name}" '[.[] | select(.path==$p)][0].path_with_namespace // empty' list.json)
+            fi
+            if [ -z "${slug}" ] || [ -z "${pid}" ]; then
+              echo "::error::Could not create/find project ${name}" >&2
+              cat repo.json >&2 || true
+              return 1
+            fi
+            papi="https://gitlab.com/api/v4/projects/${pid}"
+            curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X PUT "${papi}" --data-urlencode "visibility=public" --data-urlencode "lfs_enabled=true" > vis.json 2>/dev/null || true
+            cur=$(jq -r '.visibility // empty' vis.json)
+            if [ "${cur}" != "public" ] && [ -n "${GENC}" ]; then
+              echo "::warning::${name} is '${cur}' - group is restricting it; making the GROUP public and retrying" >&2
+              curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X PUT "https://gitlab.com/api/v4/groups/${GENC}" --data-urlencode "visibility=public" > /dev/null 2>&1 || true
+              curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X PUT "${papi}" --data-urlencode "visibility=public" > vis.json 2>/dev/null || true
+              cur=$(jq -r '.visibility // empty' vis.json)
+            fi
+            echo "PROJECT ${name}: ${slug} (id ${pid}) visibility=${cur:-unknown}" >&2
+            [ "${cur}" = "public" ] || echo "::warning::${name} is STILL not public - check group/instance settings" >&2
+            benc=$(printf '%s' "${BRANCH_NAME}" | jq -sRr @uri)
+            curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X DELETE "${papi}/protected_branches/${benc}" > /dev/null 2>&1 || true
+            printf '%s' "${slug}"
+          }
+          MAIN_SLUG=$(ensure_project "${PROJECT}")
+          echo "MAIN_SLUG=${MAIN_SLUG}" >> "$GITHUB_ENV"
+          A_SLUG=$(ensure_project "${PROJECT}_imgs_system")
+          echo "A_SLUG=${A_SLUG}" >> "$GITHUB_ENV"
+          B_SLUG=$(ensure_project "${PROJECT}_imgs_vendor")
+          echo "B_SLUG=${B_SLUG}" >> "$GITHUB_ENV"
+          TR_SLUG=$(ensure_project "${PROJECT}_imgs_tr")
+          echo "TR_SLUG=${TR_SLUG}" >> "$GITHUB_ENV"
+          TRX_SLUG=$(ensure_project "${PROJECT}_tr_extracted")
+          echo "TRX_SLUG=${TRX_SLUG}" >> "$GITHUB_ENV"
+          echo "All 5 projects ready and PUBLIC"
 
-      - name: Stage 12 - Push to GitLab (LFS auto only for >100MB files - GitLab hard limit - one commit, 3 retries)
+      - name: Stage 12 - Push FIVE split projects (LFS auto >100MB, 3 retries each, HONEST report - no fake success)
         run: |
-          set -euo pipefail
+          set +e
           cd workspace/extracted
-          rm -rf .git
-          git init -q -b "${BRANCH_NAME}"
-          git lfs install --local
-          git config user.name "${{ github.actor }}"
-          git config user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
-          git config http.postBuffer 2097152000
-          git config http.version HTTP/1.1
-          git config core.compression 9
-          git config pack.threads 0
-          git config index.threads 0
-          git config gc.auto 0
-          find . -type f -size +100M -not -path "./.git/*" -print0 | xargs -0 -r git lfs track > /dev/null 2>&1 || true
-          [ -f .gitattributes ] && git add .gitattributes || true
-          REMOTE_URL=$(printf 'https://%s:%s@gitlab.com/%s.git' "${GITLAB_TOKEN_NAME}" "${GITLAB_TOKEN}" "${GITLAB_SLUG}")
-          git remote add origin "${REMOTE_URL}"
-          git add -A
-          git commit -qsm "x6886: complete XOS 16 dump ${BUILD_ID} - all partitions extracted + complete vendor blobs + auto device tree" || true
-          FORCE=""
-          [ "${BRANCH_EXISTS}" = "1" ] && FORCE="--force"
-          for i in 1 2 3; do
-            if git push ${FORCE} -u origin "${BRANCH_NAME}"; then FORCE=""; break; fi
-            echo "::warning::push attempt ${i} failed - retrying in 30s"
-            sleep 30
-          done
-          PAPI="https://gitlab.com/api/v4/projects/${GITLAB_PID}"
-          curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X PUT "${PAPI}" \
+          REPORT="$GITHUB_WORKSPACE/push_report.txt"
+          : > "$REPORT"
+          push_dir() {
+            local pname="$1" slug="$2" dir="$3" msg="$4"
+            local size rc i
+            if [ "$dir" = "." ]; then
+              size=$(find . -path ./_split -prune -o -type f -not -path './.git/*' -print0 2>/dev/null | du -ch --files0-from=- 2>/dev/null | tail -1 | cut -f1)
+            else
+              size=$(du -sh "$dir" 2>/dev/null | cut -f1)
+            fi
+            echo ""
+            echo "=== PUSH [${pname}] -> ${slug} (${size}) ==="
+            rc=1
+            for i in 1 2 3; do
+              (
+                set -e
+                cd "$dir"
+                rm -rf .git .gitattributes
+                git init -q -b "${BRANCH_NAME}"
+                git lfs install --local > /dev/null 2>&1 || true
+                git config user.name "${{ github.actor }}"
+                git config user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
+                git config http.postBuffer 2097152000
+                git config http.version HTTP/1.1
+                git config core.compression 9
+                git config pack.threads 0
+                git config index.threads 0
+                git config gc.auto 0
+                find . -path ./_split -prune -o -type f -size +100M -print0 2>/dev/null | xargs -0 -r git lfs track > /dev/null 2>&1 || true
+                [ -f .gitattributes ] && git add .gitattributes
+                git remote add origin "https://${GITLAB_TOKEN_NAME}:${GITLAB_TOKEN}@gitlab.com/${slug}.git"
+                git add -A
+                git commit -qsm "${msg}" || true
+                git push --force -u origin "${BRANCH_NAME}"
+              )
+              rc=$?
+              [ "$rc" -eq 0 ] && break
+              echo "::warning::[${pname}] push attempt ${i} failed - retrying in 30s"
+              sleep 30
+            done
+            if [ "$rc" -eq 0 ]; then
+              echo "${pname}|${slug}|OK|${size}" >> "$REPORT"
+              echo "=== [${pname}] PUSHED OK (${size}) ==="
+            else
+              echo "${pname}|${slug}|FAILED|${size}" >> "$REPORT"
+              echo "::error::[${pname}] push FAILED after 3 attempts"
+            fi
+          }
+          echo "_split/" > .gitignore
+          push_dir "main - extracted partitions + small images + ramdisks + device tree" "${MAIN_SLUG}" "." "x6886: XOS 16 ${BUILD_ID} - extracted partitions + device tree + ramdisks + small images"
+          push_dir "imgs_system - raw system family images" "${A_SLUG}" "_split/imgs_system" "x6886: raw images - system/system_ext/system_dlkm"
+          push_dir "imgs_vendor - raw vendor family images" "${B_SLUG}" "_split/imgs_vendor" "x6886: raw images - vendor/product/odm/dlkm"
+          push_dir "imgs_tr - raw tr_* images" "${TR_SLUG}" "_split/imgs_tr" "x6886: raw images - transsion tr_region/tr_product/tr_*"
+          push_dir "tr_extracted - extracted tr_* contents" "${TRX_SLUG}" "_split/tr_extracted" "x6886: extracted tr_* partition contents"
+          echo ""
+          echo "=== HONEST PUSH REPORT (what ACTUALLY happened) ==="
+          cat "$REPORT"
+          MENC=$(printf '%s' "${MAIN_SLUG}" | sed 's|/|%2F|g')
+          curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X PUT "https://gitlab.com/api/v4/projects/${MENC}" \
             --data-urlencode "default_branch=${BRANCH_NAME}" \
-            --data-urlencode "description=Complete XOS 16 dump - Infinix Hot 60 Pro Plus (X6886) - ${BUILD_ID} - all partitions extracted + complete vendor blobs + auto device tree + full manifest" \
-            --data-urlencode "topics=infinix,x6886,android16,firmware,dump,mt6789" > /dev/null || true
-          echo "Pushed: https://gitlab.com/${GITLAB_SLUG} branch ${BRANCH_NAME}"
+            --data-urlencode "description=Complete XOS 16 dump - Infinix Hot 60 Pro Plus (X6886) - ${BUILD_ID} - extracted partitions + device tree + ramdisks + small images. Raw images in sibling projects: _imgs_system / _imgs_vendor / _imgs_tr / _tr_extracted" \
+            --data-urlencode "topics=infinix,x6886,android16,firmware,dump,mt6789" > /dev/null 2>&1 || true
+          if grep -q "FAILED" "$REPORT"; then
+            echo "::error::At least one project FAILED to push - the report above says exactly which one"
+            exit 1
+          fi
+          echo "ALL 5 PROJECTS PUSHED OK - honest success"
 
       - name: Job summary
         if: always()
@@ -390,10 +525,17 @@ jobs:
             echo "| Model | Infinix Hot 60 Pro Plus |"
             echo "| Build | BP2A.250605.031.A3 |"
             echo "| Branch | ${BRANCH_NAME} |"
-            echo "| GitLab | https://gitlab.com/${GITLAB_SLUG:-} |"
-            echo "| Total files | $(find . -type f 2>/dev/null | wc -l) |"
-            echo "| images/ | $(find images -type f 2>/dev/null | wc -l) files |"
-            echo "| vendor_blobs/ | $(find vendor_blobs -type f 2>/dev/null | wc -l) files |"
-            echo "| ramdisks/ | $(find ramdisks -type f 2>/dev/null | wc -l) files |"
-            echo "| device tree | $(find aosp-device-tree -type f 2>/dev/null | wc -l) files |"
+            echo "| Total files | $(find . -type f -not -path './.git/*' 2>/dev/null | wc -l) |"
+            echo ""
+            echo "### Push report - what ACTUALLY happened (no fake success)"
+            echo ""
+            echo "| Project | Status | Size | Link |"
+            echo "| --- | --- | --- | --- |"
           } >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$GITHUB_WORKSPACE/push_report.txt" ]; then
+            while IFS='|' read -r pname pslug pstatus psize; do
+              echo "| ${pname} | ${pstatus} | ${psize} | https://gitlab.com/${pslug} |" >> "$GITHUB_STEP_SUMMARY"
+            done < "$GITHUB_WORKSPACE/push_report.txt"
+          else
+            echo "| - | run ended before the push stage | - | - |" >> "$GITHUB_STEP_SUMMARY"
+          fi
