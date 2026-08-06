@@ -84,22 +84,30 @@ jobs:
         with:
           swap-size-gb: 12
 
-      - name: Stage 2c - Install super tools (aria2 + payload-dumper-go + lpunpack + simg2img + erofs + aospdtgen)
+      - name: Stage 2c - Install super tools (aria2 + payload-dumper-go + lpunpack + simg2img + erofs + aospdtgen - NEVER fails)
         run: |
-          set -euo pipefail
+          set +e
           sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2 cpio lz4 p7zip-full brotli zstd erofs-utils erofs-fuse simg2img android-sdk-libsparse-utils python3-pip git-lfs jq xmlstarlet device-tree-compiler > /dev/null 2>&1 || sudo apt-get install -y -qq aria2 cpio lz4 p7zip-full brotli zstd erofs-utils simg2img python3-pip git-lfs jq device-tree-compiler > /dev/null
-          pip3 install --quiet --break-system-packages protobuf six pycryptodome || true
+          # Small isolated groups - one wrong package name can NEVER kill the stage
+          # NOTE: simg2img ships INSIDE android-sdk-libsparse-utils (no standalone package)
+          sudo apt-get install -y -qq aria2 cpio lz4 zstd brotli p7zip-full jq git-lfs python3-pip python3-venv > /dev/null 2>&1
+          sudo apt-get install -y -qq erofs-utils > /dev/null 2>&1
+          sudo apt-get install -y -qq erofs-fuse > /dev/null 2>&1
+          sudo apt-get install -y -qq android-sdk-libsparse-utils > /dev/null 2>&1
+          sudo apt-get install -y -qq device-tree-compiler xmlstarlet > /dev/null 2>&1
+          pip3 install --quiet --break-system-packages protobuf six pycryptodome 2>/dev/null
           mkdir -p "$HOME/bin" && echo "$HOME/bin" >> "$GITHUB_PATH"
           cd /tmp
-          wget -q https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz -O pdg.tar.gz || true
-          tar -xzf pdg.tar.gz 2>/dev/null || true
+          wget -q https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz -O pdg.tar.gz 2>/dev/null
+          tar -xzf pdg.tar.gz 2>/dev/null
           if [ -f payload-dumper-go ]; then install -m755 payload-dumper-go "$HOME/bin/"; else echo "::warning::payload-dumper-go download failed - python fallback ready"; fi
-          git clone -q --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg /tmp/mkbootimg || true
-          git clone -q --depth=1 https://github.com/sebaubuntu-python/aospdtgen /tmp/aospdtgen || true
-          pip3 install --quiet --break-system-packages /tmp/aospdtgen 2>/dev/null || pip3 install --quiet --break-system-packages aospdtgen || true
-          git clone -q --depth=1 https://github.com/unix3dgforce/lpunpack /tmp/lpunpack || true
-          echo "Tools check: pdg=$(command -v payload-dumper-go || echo py-fallback) erofs=$(command -v extract.erofs || echo none) aospdtgen=$(command -v aospdtgen || echo none)"
+          git clone -q --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg /tmp/mkbootimg 2>/dev/null
+          git clone -q --depth=1 https://github.com/sebaubuntu-python/aospdtgen /tmp/aospdtgen 2>/dev/null
+          pip3 install --quiet --break-system-packages /tmp/aospdtgen 2>/dev/null || pip3 install --quiet --break-system-packages aospdtgen 2>/dev/null
+          git clone -q --depth=1 https://github.com/unix3dgforce/lpunpack /tmp/lpunpack 2>/dev/null
+          echo "Tools check: aria2=$(command -v aria2c || echo MISSING) pdg=$(command -v payload-dumper-go || echo py-fallback) fsck.erofs=$(command -v fsck.erofs || echo none) extract.erofs=$(command -v extract.erofs || echo none) simg2img=$(command -v simg2img || echo none) aospdtgen=$(command -v aospdtgen || echo none)"
+          echo "Stage 2c done - every tool has a fallback in later stages, this stage never fails"
+          exit 0
 
       - name: Stage 3 - Download OTA (aria2c 16 connections + full-package verification)
         run: |
