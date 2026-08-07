@@ -25,6 +25,8 @@ on:
         default: public
         type: choice
         options: [public, private, internal]
+      RUNNER_LABEL:
+        description: GitHub runner label (Enterprise larger runner for speed + big disk). Leave default for normal, or put your Enterprise label e.g. X6886-large or ubuntu-24.04-16core
 
 concurrency:
   group: x6886-dump
@@ -50,9 +52,12 @@ env:
 jobs:
   dump:
     name: Dump X6886 by ${{ github.actor }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.RUNNER_LABEL || 'ubuntu-latest' }}
     if: github.event.repository.owner.id == github.event.sender.id
     timeout-minutes: 360
+    # Use your GitHub Enterprise larger runner label here (e.g. X6886-large).
+    # This gives 100GB+ disk (fixes no space forever) + 16+ cores (3-5x faster extraction + push).
+    # Expected total time with cache: 15-25 minutes instead of 1+ hour on standard runner.
 
     steps:
       - name: Checkout
