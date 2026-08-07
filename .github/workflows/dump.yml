@@ -277,17 +277,10 @@ jobs:
           echo "Boot images done - ZERO magiskboot, ZERO Illegal instruction possible"
           exit 0
 
-      - name: Stage 8 - Generate REAL device tree automatically (aospdtgen on fully extracted dump + name fix)
+      - name: Stage 8 - (Device tree generation REMOVED from main dump - we will do it LATER as separate step, per your idea)
         run: |
-          set +e
-          cd workspace/extracted
-          echo "Generating android_device_infinix_x6886 with aospdtgen..."
-          aospdtgen . --output aosp-device-tree 2>&1 | tail -25 || python3 -m aospdtgen . --output aosp-device-tree 2>&1 | tail -25 || echo "::warning::aospdtgen partial output"
-          if [ -d aosp-device-tree ]; then
-            find aosp-device-tree -type f \( -name "*.mk" -o -name "*.bp" -o -name "BoardConfig*" -o -name "*.prop" -o -name "*.rc" \) -exec sed -i -e 's/transsion/infinix/gi' -e 's/tssi/x6886/g' -e 's/TSSI/X6886/g' {} + 2>/dev/null || true
-            echo "Device tree files: $(find aosp-device-tree -type f | wc -l)"
-            ls aosp-device-tree/ 2>/dev/null || true
-          fi
+          echo "Device tree (aospdtgen) skipped in main dump - will do after the dump is ready for better speed and organization"
+          echo "DumprX is the base idea - our extraction stages are optimized version of it"
           exit 0
 
       - name: Stage 9 - Device info (hard-locked correct values + raw props evidence + README)
@@ -321,7 +314,7 @@ jobs:
             echo "- images/ - ALL 35 partition images + kernel + dtb (raw, real sizes)"
             echo "- system/ system_ext/ vendor/ product/ odm/ vendor_dlkm/ odm_dlkm/ system_dlkm/ tr_*/ - every partition fully extracted (real contents)"
             echo "- ramdisks/ - boot + vendor_boot + init_boot unpacked with every ramdisk extracted (magic-byte detection)"
-            echo "- aosp-device-tree/ - auto-generated device tree (review and refine manually)"
+            echo "- (aosp-device-tree/ will be generated LATER in separate workflow)"
             echo "- device_info/ + proprietary-files-list.txt + complete_dump_manifest.txt"
           } > README.md
 
@@ -353,7 +346,7 @@ jobs:
             echo "Device: Infinix Hot 60 Pro Plus (X6886) | Build BP2A.250605.031.A3 | Android 16"
             echo "Date: $(date -u)"
             echo ""
-            for d in images ramdisks device_info aosp-device-tree system system_ext vendor product odm vendor_dlkm odm_dlkm system_dlkm tr_region tr_product tr_preload; do
+            for d in images ramdisks device_info system system_ext vendor product odm vendor_dlkm odm_dlkm system_dlkm tr_region tr_product tr_preload; do
               [ -d "$d" ] && echo "$d/: $(find "$d" -type f 2>/dev/null | wc -l) files, $(du -sh "$d" 2>/dev/null | cut -f1)"
             done
             echo ""
