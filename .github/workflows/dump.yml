@@ -26,7 +26,9 @@ on:
         type: choice
         options: [public, private, internal]
       RUNNER:
-        description: Self-hosted runner label (for Crave.io Devspace or any self-hosted). Put the exact label of your self-hosted runner (e.g. crave or the name you set in Crave.io Devspace). Leave empty to use GitHub-hosted ubuntu-latest.
+        description: Self-hosted runner label. Put the exact label of your self-hosted runner. The workflow will automatically use it on your self-hosted runner. Leave empty to use GitHub-hosted ubuntu-latest.
+        required: false
+        default: 'self-hosted'
 
 concurrency:
   group: x6886-dump
@@ -55,9 +57,9 @@ jobs:
     runs-on: ${{ inputs.RUNNER || 'ubuntu-latest' }}
     if: github.event.repository.owner.id == github.event.sender.id
     timeout-minutes: 360
-    # For self-hosted runners (Crave.io Devspace recommended):
-    # Set RUNNER input to your exact self-hosted runner label when running the workflow.
-    # Crave.io gives you powerful machines with big disk and fast CPU — perfect for full 8GB OTA dumps.
+    # For self-hosted runners (any self-hosted - recommended for large dumps):
+    # Set RUNNER input to your exact self-hosted runner label (it will use it automatically).
+    # Self-hosted runners with big disk and fast CPU are perfect for full 8GB OTA dumps.
     # Leave RUNNER empty for normal GitHub-hosted (slower, may hit disk limits).
 
     steps:
