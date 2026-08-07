@@ -160,17 +160,17 @@ jobs:
           echo "Our ramdisk script added (DumprX may have done some too)"
           exit 0
 
-      - name: Stage 8 - Run DumprX itself (dumper.sh + setup.sh - the real tool or improved fork)
+      - name: Stage 8 - Run DumprX itself (dumper.sh + setup.sh - LIVE output, NOTHING hidden, no tail)
         run: |
           set +e
-          echo "=== Using DumprX ذات نفسو (or improved fork) as the core ==="
+          echo "=== Using DumprX ذات نفسو as the core (LIVE - everything visible) ==="
           git clone --depth=1 https://github.com/DumprX/DumprX.git || true
           cd DumprX
-          echo "Running setup.sh ..."
-          bash setup.sh 2>&1 | tail -30 || true
+          echo "Running setup.sh (LIVE)..."
+          bash setup.sh || true
           cd ..
-          echo "Running dumper.sh on the OTA link (DumprX itself)..."
-          bash DumprX/dumper.sh "${FIRMWARE_LINK}" 2>&1 | tail -100 || echo "::warning::dumper.sh finished (or check for improved fork)"
+          echo "Running dumper.sh on the OTA link (LIVE - you will see every download %, every partition being extracted, EVERYTHING)..."
+          bash DumprX/dumper.sh "${FIRMWARE_LINK}" || echo "::warning::dumper.sh exited non-zero - still continuing to collect output"
           echo "=== DumprX run done ==="
           ls -la | head -40 || true
           mkdir -p workspace/extracted
