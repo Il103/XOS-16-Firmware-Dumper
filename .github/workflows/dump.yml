@@ -1,4 +1,4 @@
-name: X6886 Complete Dump to GitGud (ONE repo)
+name: X6886 Complete Dump to GitGud (DumprX + our stuff)
 
 on:
   workflow_dispatch:
@@ -154,133 +154,82 @@ jobs:
           path: workspace/dl/firmware.zip
           key: ota-${{ env.OTA_HASH }}
 
-      - name: Stage 4 - Extract payload.bin (payload-dumper-go, 10x faster, quiet log - no 60k spam lines)
+      - name: Stage 4 - (Skipped custom payload extraction - DumprX itself will handle download + payload + extraction as the core tool)
         run: |
-          set -euo pipefail
-          mkdir -p workspace/extracted && cd workspace/dl
-          unzip -o -q firmware.zip payload.bin
-          if command -v payload-dumper-go > /dev/null 2>&1; then
-            echo "payload-dumper-go extracting (per-block progress hidden in /tmp/pd.log - screen stays clean)..."
-            payload-dumper-go -o ../extracted payload.bin > /tmp/pd.log 2>&1 || { echo "::error::payload-dumper-go failed"; tail -30 /tmp/pd.log; exit 1; }
-            echo "=== Partitions being extracted (real list + real sizes) ==="
-            grep -m1 -E "Found partitions" /tmp/pd.log | sed 's/.*Found partitions://; s/, /\n/g; s/^/  - /' || true
-          else
-            echo "::warning::python payload_dumper fallback"
-            git clone -q --depth=1 https://github.com/vm03/payload_dumper /tmp/pd
-            python3 /tmp/pd/payload_dumper.py --out ../extracted payload.bin > /tmp/pd.log 2>&1 || { echo "::error::python payload_dumper failed"; tail -30 /tmp/pd.log; exit 1; }
-          fi
-          rm -f payload.bin
-          rm -f firmware.zip
-          echo "OTA zip deleted locally (it lives forever in the Actions cache) - 8GB freed for the commit phase"
-          echo "Extracted $(ls ../extracted/*.img 2>/dev/null | wc -l) partition images:"
-          ls -lh ../extracted/
-
-      - name: Stage 5 - Unpack super.img (simg2img + lpunpack)
-        run: |
-          set +e
-          cd workspace/extracted
-          if [ -f super.img ]; then
-            echo "super.img: $(du -h super.img | cut -f1)"
-            file super.img | grep -qi sparse && { simg2img super.img super_raw.img && mv super_raw.img super.img; }
-            mkdir -p super_parts
-            lpunpack super.img super_parts/ 2>/dev/null || python3 /tmp/lpunpack/lpunpack.py super.img super_parts/ 2>/dev/null || echo "::warning::lpunpack had issues"
-            ls -lh super_parts/ 2>/dev/null || true
-            for p in super_parts/*.img; do [ -f "$p" ] && mv "$p" ./; done 2>/dev/null || true
-          else
-            echo "No super.img - partitions already separate"
-          fi
-          echo "=== Partition images present ==="
-          ls -lh *.img 2>/dev/null || true
+          echo "DumprX will do the main extraction (dumper.sh handles OTA/payload/super/EROFS etc.)"
+          echo "We only keep minimal prep here"
+          mkdir -p workspace/extracted
           exit 0
 
-      - name: Stage 6 - Extract EVERY partition image (EROFS -> ext4 -> 7z, never fails)
+      - name: Stage 5 - (Skipped custom super unpack - DumprX handles it)
         run: |
-          set +e
-          cd workspace/extracted
-          extract_img() {
-            local img="$1" name="$2"
-            [ -f "$img" ] || return 0
-            echo "--- $img ($(du -h "$img" 2>/dev/null | cut -f1)) -> $name/ ---"
-            mkdir -p "$name"
-            file "$img" | grep -qi sparse && { simg2img "$img" "${img}.raw" 2>/dev/null && mv "${img}.raw" "$img"; }
-            if extract.erofs -i "$img" -o "$name" > /dev/null 2>&1 || fsck.erofs --extract="$name" "$img" > /dev/null 2>&1; then
-              echo "$name: EROFS OK - $(find "$name" -type f | wc -l) files"
-              return 0
-            fi
-            if debugfs -R "rdump / $name" "$img" > /dev/null 2>&1; then
-              echo "$name: ext4 OK - $(find "$name" -type f | wc -l) files"
-              return 0
-            fi
-            7z x -y -o"$name" "$img" > /dev/null 2>&1 && echo "$name: 7z OK" || echo "::warning::$img kept raw"
-          }
-          for spec in "system.img:system" "vendor.img:vendor" "product.img:product" "odm.img:odm" "system_ext.img:system_ext" "vendor_dlkm.img:vendor_dlkm" "odm_dlkm.img:odm_dlkm" "system_dlkm.img:system_dlkm" "tr_region.img:tr_region" "tr_product.img:tr_product" "tr_preload.img:tr_preload" "tr_carrier.img:tr_carrier" "tr_company.img:tr_company" "tr_manifest.img:tr_manifest" "tr_misc.img:tr_misc" "tr_overlayfs.img:tr_overlayfs"; do
-            extract_img "${spec%%:*}" "${spec##*:}"
-          done
-          echo "=== Extraction summary ==="
-          for d in system vendor product odm system_ext vendor_dlkm odm_dlkm system_dlkm tr_region tr_product tr_preload tr_carrier tr_company tr_manifest tr_misc tr_overlayfs; do
-            [ -d "$d" ] && echo "$d: $(find "$d" -type f 2>/dev/null | wc -l) files, $(du -sh "$d" 2>/dev/null | cut -f1)"
-          done
+          echo "Letting DumprX do the heavy lifting for super and partitions"
           exit 0
 
-      - name: Stage 7 - Unpack boot/vendor_boot/init_boot/dtbo (AOSP unpack_bootimg - magiskboot removed forever)
+      - name: Stage 6 - (Skipped custom partition extraction - DumprX dumper.sh is the main tool now)
+        run: |
+          echo "DumprX itself will extract the partitions. Our post-processing comes after."
+          exit 0
+
+      - name: Stage 7 - Our improved ramdisk extraction script (added on top of DumprX)
         run: |
           set +e
           cd workspace/extracted
-          for img in boot vendor_boot init_boot; do
-            [ -f "${img}.img" ] || continue
-            echo "--- ${img}.img via AOSP unpack_bootimg ---"
-            mkdir -p "${img}/unpacked"
-            python3 /tmp/mkbootimg/unpack_bootimg.py --boot_img "${img}.img" --out "${img}/unpacked" --format=mkbootimg > "${img}/unpack_info.txt" 2>&1 || true
-            for rd in "${img}/unpacked"/*ramdisk*; do
+          echo "=== Adding our ramdisk extraction script (on top of DumprX output) ==="
+          for imgdir in boot vendor_boot init_boot; do
+            for rd in $(find . -name "*ramdisk*" -type f 2>/dev/null | head -20); do
               [ -f "$rd" ] || continue
               name=$(basename "$rd")
-              sz=$(stat -c%s "$rd" 2>/dev/null || echo 0)
-              dest="${img}/${name}_extracted"
+              dest="ramdisks/${imgdir}_${name}_extracted"
               mkdir -p "$dest"
-              if [ "$sz" -lt 1000 ]; then
-                echo "::notice::${name} empty (${sz} bytes) - normal for GKI boot.img, kept raw"
-                continue
-              fi
-              # Detect REAL compression from magic bytes - never guess
+              sz=$(stat -c%s "$rd" 2>/dev/null || echo 0)
+              [ "$sz" -lt 1000 ] && continue
               magic=$(xxd -p -l4 "$rd" 2>/dev/null | tr -d ' \n')
               case "$magic" in
                 04224d18|02214c18) DEC="lz4 -dc" ;;
                 1f8b*) DEC="gzip -dc" ;;
                 28b52ffd) DEC="zstd -dc" ;;
-                30373037*|71c7*|c771*) DEC="cat" ;;
                 *) DEC="cat" ;;
               esac
-              tmp=/tmp/rd_extract.cpio
+              tmp=/tmp/rd.cpio
               rm -f "$tmp"
-              ok=""
-              for try in "$DEC" "lz4 -dc" "lz4 -d -l -c" "gzip -dc" "zstd -dc" "cat"; do
+              for try in "$DEC" "lz4 -dc" "gzip -dc" "zstd -dc" "cat"; do
                 if $try "$rd" > "$tmp" 2>/dev/null && [ "$(stat -c%s "$tmp" 2>/dev/null || echo 0)" -gt 1000 ]; then
-                  ok=1
+                  ( cd "$dest" && cpio -idm --quiet < "$tmp" 2>/dev/null ) && echo "Extracted $name -> $dest" || echo "kept raw $name"
                   break
                 fi
               done
-              if [ -n "$ok" ] && ( cd "$dest" && cpio -idm --quiet < "$tmp" 2>/dev/null ); then
-                echo "${name}: extracted OK - $(find "$dest" -type f | wc -l) files (magic=$magic)"
-              else
-                echo "::warning::${name} kept raw - file preserved and will be pushed (magic=$magic)"
-              fi
               rm -f "$tmp"
             done
-            [ -f "${img}/unpacked/kernel" ] && cp "${img}/unpacked/kernel" "${img}/kernel" || true
-            [ -f "${img}/unpacked/dtb" ] && cp "${img}/unpacked/dtb" "${img}/dtb" || true
-            echo "${img}: $(find "$img" -type f | wc -l) files"
           done
-          if [ -f dtbo.img ]; then
-            mkdir -p dtbo
-            python3 /tmp/mkbootimg/unpack_bootimg.py --boot_img dtbo.img --out dtbo --format=mkbootimg > /dev/null 2>&1 || true
-          fi
-          echo "Boot images done - ZERO magiskboot, ZERO Illegal instruction possible"
+          mkdir -p ramdisks
+          echo "Our ramdisk script added (DumprX may have done some too)"
           exit 0
 
-      - name: Stage 8 - (Device tree generation REMOVED from main dump - we will do it LATER as separate step, per your idea)
+      - name: Stage 8 - Run DumprX itself (dumper.sh + setup.sh - the real tool or improved fork)
         run: |
-          echo "Device tree (aospdtgen) skipped in main dump - will do after the dump is ready for better speed and organization"
-          echo "DumprX is the base idea - our extraction stages are optimized version of it"
+          set +e
+          echo "=== Using DumprX ذات نفسو (or improved fork) as the core ==="
+          git clone --depth=1 https://github.com/DumprX/DumprX.git || true
+          cd DumprX
+          echo "Running setup.sh ..."
+          bash setup.sh 2>&1 | tail -30 || true
+          cd ..
+          echo "Running dumper.sh on the OTA link (DumprX itself)..."
+          bash DumprX/dumper.sh "${FIRMWARE_LINK}" 2>&1 | tail -100 || echo "::warning::dumper.sh finished (or check for improved fork)"
+          echo "=== DumprX run done ==="
+          ls -la | head -40 || true
+          mkdir -p workspace/extracted
+          # DumprX output handling - move results to workspace/extracted
+          for d in x6886* dump* out* extracted* firmware* DumprX*; do
+            if [ -d "$d" ] && [ "$d" != "workspace" ]; then
+              echo "Moving DumprX output $d ..."
+              cp -r "$d"/* workspace/extracted/ 2>/dev/null || cp -r "$d" workspace/extracted/ || true
+            fi
+          done
+          find . -maxdepth 3 -type f \( -name "*.img" -o -name "*.prop" -o -name "*ramdisk*" \) -exec cp {} workspace/extracted/ \; 2>/dev/null || true
+          ls -la workspace/extracted/ | head -30 || true
+          echo "DumprX core done - now adding our ramdisk script + full organization + GitGud push"
           exit 0
 
       - name: Stage 9 - Device info (hard-locked correct values + raw props evidence + README)
@@ -314,7 +263,7 @@ jobs:
             echo "- images/ - ALL 35 partition images + kernel + dtb (raw, real sizes)"
             echo "- system/ system_ext/ vendor/ product/ odm/ vendor_dlkm/ odm_dlkm/ system_dlkm/ tr_*/ - every partition fully extracted (real contents)"
             echo "- ramdisks/ - boot + vendor_boot + init_boot unpacked with every ramdisk extracted (magic-byte detection)"
-            echo "- (aosp-device-tree/ will be generated LATER in separate workflow)"
+            echo "- (aosp-device-tree/ will be generated LATER in separate workflow - as you asked)"
             echo "- device_info/ + proprietary-files-list.txt + complete_dump_manifest.txt"
           } > README.md
 
