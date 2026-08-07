@@ -1,4 +1,4 @@
-name: X6886 Complete Dump to GitGud (DumprX + our stuff)
+name: X6886 Dump to GitGud (DumprX ONLY + our stuff - no payload-dumper-go, no double download)
 
 on:
   workflow_dispatch:
@@ -83,9 +83,7 @@ jobs:
           echo "PROJECT=${PROJECT}" >> "$GITHUB_ENV"
           echo "Device LOCKED from second zero: ${BRAND} ${CODENAME} (${MODEL}) - ${BUILD_ID}"
           echo "transsion/tssi can NEVER appear - hard-locked env vars, no build.prop guessing"
-          OTAHASH=$(printf '%s' "${FIRMWARE_LINK}" | sha256sum | cut -c1-16)
-          echo "OTA_HASH=${OTAHASH}" >> "$GITHUB_ENV"
-          echo "OTA cache key: ota-${OTAHASH} (same link = never downloaded again)"
+          echo "OTA link handled ENTIRELY by DumprX dumper.sh - no cache, no aria2, no payload-dumper-go, no double download"
 
       - name: Stage 2a - Free disk space
         uses: rokibhasansagar/slimhub_actions@main
@@ -95,64 +93,20 @@ jobs:
         with:
           swap-size-gb: 12
 
-      - name: Stage 2c - Install super tools (aria2 + payload-dumper-go + lpunpack + simg2img + erofs + aospdtgen - NEVER fails)
+      - name: Stage 2c - Minimal tools ONLY (no payload-dumper-go, no aospdtgen, no aria2 - DumprX installs its own tools via setup.sh)
         run: |
           set +e
           sudo apt-get update -qq
-          # Small isolated groups - one wrong package name can NEVER kill the stage
-          # NOTE: simg2img ships INSIDE android-sdk-libsparse-utils (no standalone package)
-          sudo apt-get install -y -qq aria2 cpio lz4 zstd brotli p7zip-full jq git-lfs python3-pip python3-venv > /dev/null 2>&1
-          sudo apt-get install -y -qq erofs-utils > /dev/null 2>&1
-          sudo apt-get install -y -qq erofs-fuse > /dev/null 2>&1
-          sudo apt-get install -y -qq android-sdk-libsparse-utils > /dev/null 2>&1
-          sudo apt-get install -y -qq device-tree-compiler xmlstarlet > /dev/null 2>&1
-          pip3 install --quiet --break-system-packages protobuf six pycryptodome 2>/dev/null
-          mkdir -p "$HOME/bin" && echo "$HOME/bin" >> "$GITHUB_PATH"
-          cd /tmp
-          wget -q https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz -O pdg.tar.gz 2>/dev/null
-          tar -xzf pdg.tar.gz 2>/dev/null
-          if [ -f payload-dumper-go ]; then install -m755 payload-dumper-go "$HOME/bin/"; else echo "::warning::payload-dumper-go download failed - python fallback ready"; fi
-          git clone -q --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg /tmp/mkbootimg 2>/dev/null
-          git clone -q --depth=1 https://github.com/sebaubuntu-python/aospdtgen /tmp/aospdtgen 2>/dev/null
-          pip3 install --quiet --break-system-packages /tmp/aospdtgen 2>/dev/null || pip3 install --quiet --break-system-packages aospdtgen 2>/dev/null
-          git clone -q --depth=1 https://github.com/unix3dgforce/lpunpack /tmp/lpunpack 2>/dev/null
-          echo "Tools check: aria2=$(command -v aria2c || echo MISSING) pdg=$(command -v payload-dumper-go || echo py-fallback) fsck.erofs=$(command -v fsck.erofs || echo none) extract.erofs=$(command -v extract.erofs || echo none) simg2img=$(command -v simg2img || echo none) aospdtgen=$(command -v aospdtgen || echo none)"
-          echo "Stage 2c done - every tool has a fallback in later stages, this stage never fails"
+          sudo apt-get install -y -qq jq git-lfs cpio lz4 zstd > /dev/null 2>&1
+          echo "Minimal tools ready (jq/git-lfs/cpio/lz4/zstd - for OUR additions only)"
+          echo "DumprX setup.sh installs every extraction tool itself - nothing extra here"
           exit 0
 
-      - name: Stage 2d - Restore OTA from cache (8GB package - never downloaded twice)
-        id: otacache
-        uses: actions/cache/restore@v4
-        with:
-          path: workspace/dl/firmware.zip
-          key: ota-${{ env.OTA_HASH }}
-
-      - name: Stage 3 - Get OTA (cache hit = instant start, else aria2c 16 connections + verification)
+      - name: Stage 3 - NO pre-download (DumprX dumper.sh downloads the OTA itself - no double download, no payload-dumper-go anywhere)
         run: |
-          set -euo pipefail
-          mkdir -p workspace/dl && cd workspace/dl
-          if [ -f firmware.zip ]; then
-            echo "::notice::OTA restored from cache - SKIPPED the whole 8GB download"
-          else
-            echo "No cache yet - downloading 8GB with aria2c (16 connections, once ever)..."
-            aria2c -x16 -s16 -k16M --file-allocation=none --summary-interval=60 -o firmware.zip "${FIRMWARE_LINK}" || curl -sSL -o firmware.zip "${FIRMWARE_LINK}"
-          fi
-          SZ=$(stat -c%s firmware.zip)
-          ls -lh firmware.zip
-          [ "${SZ}" -gt 104857600 ] || { echo "::error::Package too small (${SZ} bytes) - link dead?"; exit 1; }
-          unzip -l firmware.zip | grep -q 'payload.bin' || { echo "::error::No payload.bin - not a full A/B OTA"; exit 1; }
-          if unzip -p firmware.zip META-INF/com/android/metadata 2>/dev/null | grep -q 'pre-build-incremental'; then
-            echo "::error::Incremental OTA - diffs only, cannot dump"
-            exit 1
-          fi
-          echo "Full OTA verified: $((SZ/1024/1024)) MB"
-
-      - name: Stage 3b - Save OTA to cache (first successful download only - every future run starts instantly)
-        if: steps.otacache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: workspace/dl/firmware.zip
-          key: ota-${{ env.OTA_HASH }}
+          echo "Skipping our own download entirely - dumper.sh handles the OTA link directly"
+          echo "This removes the old double-download (8GB by us + 8GB inside DumprX) that made runs take forever"
+          exit 0
 
       - name: Stage 4 - (Skipped custom payload extraction - DumprX itself will handle download + payload + extraction as the core tool)
         run: |
