@@ -125,39 +125,9 @@ jobs:
           echo "DumprX itself will extract the partitions. Our post-processing comes after."
           exit 0
 
-      - name: Stage 7 - Our improved ramdisk extraction script (added on top of DumprX)
+      - name: Stage 7 - (placeholder - ramdisk extraction runs in Stage 8b AFTER DumprX, it needs DumprX output first)
         run: |
-          set +e
-          cd workspace/extracted
-          echo "=== Adding our ramdisk extraction script (on top of DumprX output) ==="
-          for imgdir in boot vendor_boot init_boot; do
-            for rd in $(find . -name "*ramdisk*" -type f 2>/dev/null | head -20); do
-              [ -f "$rd" ] || continue
-              name=$(basename "$rd")
-              dest="ramdisks/${imgdir}_${name}_extracted"
-              mkdir -p "$dest"
-              sz=$(stat -c%s "$rd" 2>/dev/null || echo 0)
-              [ "$sz" -lt 1000 ] && continue
-              magic=$(xxd -p -l4 "$rd" 2>/dev/null | tr -d ' \n')
-              case "$magic" in
-                04224d18|02214c18) DEC="lz4 -dc" ;;
-                1f8b*) DEC="gzip -dc" ;;
-                28b52ffd) DEC="zstd -dc" ;;
-                *) DEC="cat" ;;
-              esac
-              tmp=/tmp/rd.cpio
-              rm -f "$tmp"
-              for try in "$DEC" "lz4 -dc" "gzip -dc" "zstd -dc" "cat"; do
-                if $try "$rd" > "$tmp" 2>/dev/null && [ "$(stat -c%s "$tmp" 2>/dev/null || echo 0)" -gt 1000 ]; then
-                  ( cd "$dest" && cpio -idm --quiet < "$tmp" 2>/dev/null ) && echo "Extracted $name -> $dest" || echo "kept raw $name"
-                  break
-                fi
-              done
-              rm -f "$tmp"
-            done
-          done
-          mkdir -p ramdisks
-          echo "Our ramdisk script added (DumprX may have done some too)"
+          echo "Our ramdisk script runs AFTER DumprX (Stage 8b) - it needs the DumprX output to exist first"
           exit 0
 
       - name: Stage 8 - Run DumprX itself (dumper.sh + setup.sh - LIVE output, NOTHING hidden, no tail)
@@ -172,18 +142,65 @@ jobs:
           echo "Running dumper.sh on the OTA link (LIVE - you will see every download %, every partition being extracted, EVERYTHING)..."
           bash DumprX/dumper.sh "${FIRMWARE_LINK}" || echo "::warning::dumper.sh exited non-zero - still continuing to collect output"
           echo "=== DumprX run done ==="
-          ls -la | head -40 || true
+          ls -la || true
           mkdir -p workspace/extracted
-          # DumprX output handling - move results to workspace/extracted
-          for d in x6886* dump* out* extracted* firmware* DumprX*; do
-            if [ -d "$d" ] && [ "$d" != "workspace" ]; then
-              echo "Moving DumprX output $d ..."
-              cp -r "$d"/* workspace/extracted/ 2>/dev/null || cp -r "$d" workspace/extracted/ || true
+          # DumprX writes EVERYTHING under DumprX/out (confirmed from the run log) - copy that, never the 8GB input zip
+          if [ -d DumprX/out ]; then
+            echo "Copying DumprX/out -> workspace/extracted"
+            cp -r DumprX/out/. workspace/extracted/ 2>/dev/null || true
+          fi
+          # Stray top-level imgs/props (some DumprX versions drop them next to dumper.sh)
+          find . -maxdepth 1 -type f \( -name "*.img" -o -name "*.prop" \) -exec cp {} workspace/extracted/ \; 2>/dev/null || true
+          echo "Extracted tree size: $(du -sh workspace/extracted 2>/dev/null | cut -f1)"
+          ls -la workspace/extracted/ || true
+          echo "DumprX core done - now OUR ramdisk script (Stage 8b) + full organization + GitGud push"
+          exit 0
+
+      - name: Stage 8b - OUR ramdisk extraction (runs AFTER DumprX - AOSP unpack_bootimg.py, lz4 legacy aware, NO magiskboot)
+        run: |
+          set +e
+          cd workspace/extracted
+          echo "=== Our ramdisk extraction - handles what DumprX magiskboot could not (Illegal instruction proof) ==="
+          git clone -q --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg /tmp/mkbootimg 2>/dev/null || true
+          mkdir -p ramdisks
+          # 1) Unpack every boot image with the AOSP python tool (pure python - no magiskboot anywhere)
+          for img in boot.img vendor_boot.img init_boot.img; do
+            [ -f "$img" ] || continue
+            out="ramdisks/${img%.img}_unpacked"
+            mkdir -p "$out"
+            if [ -f /tmp/mkbootimg/unpack_bootimg.py ]; then
+              echo "--- unpacking $img with AOSP unpack_bootimg.py ---"
+              python3 /tmp/mkbootimg/unpack_bootimg.py --boot_img "$img" --out "$out" || true
+              ls -la "$out" || true
             fi
           done
-          find . -maxdepth 3 -type f \( -name "*.img" -o -name "*.prop" -o -name "*ramdisk*" \) -exec cp {} workspace/extracted/ \; 2>/dev/null || true
-          ls -la workspace/extracted/ | head -30 || true
-          echo "DumprX core done - now adding our ramdisk script + full organization + GitGud push"
+          # 2) Extract EVERY ramdisk found (ours + anything DumprX left) - magic bytes + lz4 LEGACY support
+          extract_rd() {
+            rd="$1"
+            [ -f "$rd" ] || return 0
+            sz=$(stat -c%s "$rd" 2>/dev/null || echo 0)
+            [ "$sz" -lt 1000 ] && { echo "skip $rd (empty - normal for GKI boot)"; return 0; }
+            name=$(basename "$rd")
+            dest="ramdisks/${name}_extracted"
+            mkdir -p "$dest"
+            magic=$(od -An -tx1 -N4 "$rd" 2>/dev/null | tr -d ' \n')
+            echo "--- $rd (size=$sz magic=$magic) ---"
+            tmp=/tmp/rd.cpio; rm -f "$tmp"
+            for try in "lz4 -dc" "lz4 -d -l -c" "gzip -dc" "zstd -dc" "cat"; do
+              if $try "$rd" > "$tmp" 2>/dev/null && [ "$(stat -c%s "$tmp" 2>/dev/null || echo 0)" -gt 1000 ]; then
+                if ( cd "$dest" && cpio -idm --quiet < "$tmp" 2>/dev/null ); then
+                  echo "EXTRACTED: $rd -> $dest ($(find "$dest" -type f | wc -l) files, via: $try)"
+                else
+                  echo "kept raw $rd (decompressed via $try but not a cpio)"
+                fi
+                break
+              fi
+            done
+            rm -f "$tmp"
+          }
+          find ramdisks -type f \( -name "*ramdisk*" -o -name "*.cpio" \) ! -path "*_extracted/*" 2>/dev/null | while read -r f; do extract_rd "$f"; done
+          find . -maxdepth 3 -type f -name "*ramdisk*" ! -path "./ramdisks/*" 2>/dev/null | while read -r f; do extract_rd "$f"; done
+          echo "=== Ramdisk stage done: $(find ramdisks -type d -name '*_extracted' 2>/dev/null | wc -l) extracted folders ==="
           exit 0
 
       - name: Stage 9 - Device info (hard-locked correct values + raw props evidence + README)
