@@ -162,6 +162,8 @@ jobs:
             python3 /tmp/pd/payload_dumper.py --out ../extracted payload.bin > /tmp/pd.log 2>&1 || { echo "::error::python payload_dumper failed"; tail -30 /tmp/pd.log; exit 1; }
           fi
           rm -f payload.bin
+          rm -f firmware.zip
+          echo "OTA zip deleted locally (it lives forever in the Actions cache) - 8GB freed for the commit phase"
           echo "Extracted $(ls ../extracted/*.img 2>/dev/null | wc -l) partition images:"
           ls -lh ../extracted/
 
@@ -381,17 +383,19 @@ jobs:
           [ -n "${SLUG}" ] && [ -n "${PID}" ] || { echo "::error::Could not create/find the GitGud project"; cat repo.json; exit 1; }
           PAPI="https://gitgud.io/api/v4/projects/${PID}"
           curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X PUT "${PAPI}" --data-urlencode "visibility=public" --data-urlencode "lfs_enabled=true" > vis.json 2>/dev/null || true
-          echo "Visibility: $(jq -r '.visibility // \"?\"' vis.json)"
+          VIS=$(jq -r '.visibility' vis.json 2>/dev/null || echo unknown)
+          echo "Visibility: ${VIS:-unknown}"
           BENC=$(printf '%s' "${BRANCH_NAME}" | jq -sRr @uri)
           curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X DELETE "${PAPI}/protected_branches/${BENC}" > /dev/null 2>&1 || true
           echo "GITLAB_SLUG=${SLUG}" >> "$GITHUB_ENV"
           echo "GITLAB_PID=${PID}" >> "$GITHUB_ENV"
           echo "Project ready: https://gitgud.io/${SLUG} (id ${PID})"
 
-      - name: Stage 12 - Push EVERYTHING to the ONE GitGud repo (aggressive LFS, 3 retries, HONEST result)
+      - name: Stage 12 - Push EVERYTHING to the ONE GitGud repo (disk-smart split commits, aggressive LFS, HONEST result)
         run: |
           set +e
           cd workspace/extracted
+          df -h "$PWD" | tail -1
           rm -rf .git .gitattributes .gitignore
           git init -q -b "${BRANCH_NAME}"
           git lfs install --local
@@ -403,15 +407,49 @@ jobs:
           git config pack.threads 0
           git config index.threads 0
           git config gc.auto 0
-          # Aggressive LFS - every heavy/binary type via LFS (per-object uploads, proven 158MB/s here) so the plain git pack stays small and send-pack never dies mid-POST
+          git config lfs.concurrenttransfers 16
+          TOTAL=$(find . -type f -not -path './.git/*' 2>/dev/null | wc -l)
+          SIZE=$(du -sh --exclude=.git . 2>/dev/null | cut -f1)
+          # Aggressive LFS - every heavy/binary type via LFS (per-object uploads, proven 158MB/s here) so the plain git pack stays small
           git lfs track "*.img" "*.so" "*.apk" "*.apex" "*.bin" "*.dat" "*.ko" "*.vdex" "*.odex" "*.art" "*.arsc" "*.pak" "*.ttf" "*.otf" "*.jar" "*.zip" "*.gz" "*.zst" "*.br" "*.xz" "*.lz4" "*.cpio" "*.dtb" "*.fw" "*.elf" "*.ogg" "*.wav" "*.mp3" "*.mp4" "*.pb" "*.tflite" "*.webp" > /dev/null 2>&1 || true
           find . -type f -size +50M -not -path "./.git/*" -print0 2>/dev/null | xargs -0 -r git lfs track > /dev/null 2>&1 || true
           [ -f .gitattributes ] && git add .gitattributes
           git remote add origin "https://${GITLAB_TOKEN_NAME}:${GITLAB_TOKEN}@gitgud.io/${GITLAB_SLUG}.git"
-          git add -A
-          git commit -qsm "x6886: complete XOS 16 dump ${BUILD_ID} - EVERYTHING in ONE repo: all images + every partition extracted + ramdisks + device tree" || true
-          TOTAL=$(find . -type f -not -path './.git/*' 2>/dev/null | wc -l)
-          SIZE=$(du -sh --exclude=.git . 2>/dev/null | cut -f1)
+          # DISK-SMART: commit in 3 parts, deleting each part from the WORKING TREE after its commit.
+          # git push reads objects from .git only - working-tree files are NOT needed at push time.
+          # Peak disk drops from ~60GB (26G tree + 26G .git + 8G zip) to ~40GB - no more "no space left on device".
+          echo "=== Commit 1/3: raw partition images (images/) ==="
+          if git add images/ && git commit -qsm "x6886: all 35 raw partition images (real sizes)"; then
+            rm -rf images
+            echo "images/ safe in .git - working copy deleted, disk freed"
+          else
+            echo "::warning::images/ commit had an issue - kept on disk"
+          fi
+          echo "=== Commit 2/3: extracted tr_* partitions ==="
+          TR_ADDED=0
+          for d in tr_region tr_product tr_preload tr_carrier tr_company tr_manifest tr_misc tr_overlayfs; do
+            if [ -d "$d" ] && [ -n "$(find "$d" -type f -print -quit 2>/dev/null)" ]; then
+              git add "$d" && TR_ADDED=1
+            fi
+          done
+          if [ "${TR_ADDED}" = "1" ] && git commit -qsm "x6886: extracted tr_* partition contents"; then
+            rm -rf tr_region tr_product tr_preload tr_carrier tr_company tr_manifest tr_misc tr_overlayfs
+            echo "tr_* safe in .git - working copies deleted, disk freed"
+          else
+            echo "::notice::no tr_* content committed - nothing to free"
+          fi
+          echo "=== Commit 3/3: everything else (extracted partitions + ramdisks + device tree + docs) ==="
+          EXC=()
+          [ -n "$(git ls-files -- images/ 2>/dev/null | head -1)" ] && EXC+=( ':(exclude)images' )
+          for d in tr_region tr_product tr_preload tr_carrier tr_company tr_manifest tr_misc tr_overlayfs; do
+            [ -n "$(git ls-files -- "$d" 2>/dev/null | head -1)" ] && EXC+=( ":(exclude)$d" )
+          done
+          git add -A -- . "${EXC[@]}"
+          git commit -qsm "x6886: extracted partitions + ramdisks + auto device tree + manifest - ${BUILD_ID}" || true
+          REPO_FILES=$(git ls-files 2>/dev/null | wc -l)
+          REPO_IMGS=$(git ls-files -- images/ 2>/dev/null | wc -l)
+          echo "Repo holds ${REPO_FILES} tracked files (${REPO_IMGS} raw images) in 3 commits"
+          [ "${REPO_IMGS}" -ge 30 ] || echo "::warning::images/ count in repo is low (${REPO_IMGS}) - check the log above"
           echo "Pushing ${TOTAL} files (${SIZE}) to https://gitgud.io/${GITLAB_SLUG} branch ${BRANCH_NAME} ..."
           rc=1
           for i in 1 2 3; do
@@ -446,7 +484,7 @@ jobs:
             echo "| Model | Infinix Hot 60 Pro Plus |"
             echo "| Build | BP2A.250605.031.A3 |"
             echo "| Branch | ${BRANCH_NAME} |"
-            echo "| Total files | $(find . -type f -not -path './.git/*' 2>/dev/null | wc -l) |"
+            echo "| Total files (tracked in the repo) | $(git ls-files 2>/dev/null | wc -l) |"
             echo "| Result | ${RESULT:-did not reach push} |"
             echo "| GitGud | https://gitgud.io/${GITLAB_SLUG:-} |"
           } >> "$GITHUB_STEP_SUMMARY"
