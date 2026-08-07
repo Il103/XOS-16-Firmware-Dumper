@@ -25,8 +25,8 @@ on:
         default: public
         type: choice
         options: [public, private, internal]
-      RUNNER_LABEL:
-        description: GitHub runner label (Enterprise larger runner for speed + big disk). Leave default for normal, or put your Enterprise label e.g. X6886-large or ubuntu-24.04-16core
+      RUNNER:
+        description: Self-hosted runner label (for Crave.io Devspace or any self-hosted). Put the exact label of your self-hosted runner (e.g. crave or the name you set in Crave.io Devspace). Leave empty to use GitHub-hosted ubuntu-latest.
 
 concurrency:
   group: x6886-dump
@@ -52,12 +52,13 @@ env:
 jobs:
   dump:
     name: Dump X6886 by ${{ github.actor }}
-    runs-on: ${{ inputs.RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.RUNNER || 'ubuntu-latest' }}
     if: github.event.repository.owner.id == github.event.sender.id
     timeout-minutes: 360
-    # Use your GitHub Enterprise larger runner label here (e.g. X6886-large).
-    # This gives 100GB+ disk (fixes no space forever) + 16+ cores (3-5x faster extraction + push).
-    # Expected total time with cache: 15-25 minutes instead of 1+ hour on standard runner.
+    # For self-hosted runners (Crave.io Devspace recommended):
+    # Set RUNNER input to your exact self-hosted runner label when running the workflow.
+    # Crave.io gives you powerful machines with big disk and fast CPU — perfect for full 8GB OTA dumps.
+    # Leave RUNNER empty for normal GitHub-hosted (slower, may hit disk limits).
 
     steps:
       - name: Checkout
