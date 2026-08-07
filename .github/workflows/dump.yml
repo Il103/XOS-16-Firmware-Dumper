@@ -1,4 +1,4 @@
-name: X6886 Complete Dump to GitLab
+name: X6886 Complete Dump to GitGud (ONE repo)
 
 on:
   workflow_dispatch:
@@ -12,9 +12,9 @@ on:
         required: false
         default: a16
       GITLAB_GROUP:
-        description: GitLab group
+        description: GitGud group (leave EMPTY for your personal namespace - simplest)
         required: false
-        default: Il103-group
+        default: ''
       PROJECT_NAME:
         description: Project name (empty = android_dump_infinix_x6886)
         required: false
@@ -36,8 +36,8 @@ env:
   GITLAB_GROUP: ${{ inputs.GITLAB_GROUP }}
   PROJECT_NAME_IN: ${{ inputs.PROJECT_NAME }}
   VISIBILITY: ${{ inputs.VISIBILITY }}
-  GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
-  GITLAB_TOKEN_NAME: ${{ secrets.GITLAB_TOKEN_NAME }}
+  GITLAB_TOKEN: ${{ secrets.GITGUD_TOKEN }}
+  GITLAB_TOKEN_NAME: ${{ secrets.GITGUD_TOKEN_NAME }}
   BRAND: infinix
   CODENAME: x6886
   MODEL: Infinix Hot 60 Pro Plus
@@ -62,13 +62,13 @@ jobs:
         run: |
           set -euo pipefail
           echo "::add-mask::${GITLAB_TOKEN}"
-          [ -n "${GITLAB_TOKEN}" ] || { echo "::error::GITLAB_TOKEN missing"; exit 1; }
-          [ -n "${GITLAB_TOKEN_NAME}" ] || { echo "::error::GITLAB_TOKEN_NAME missing"; exit 1; }
+          [ -n "${GITLAB_TOKEN}" ] || { echo "::error::Secret GITGUD_TOKEN missing - create a PAT on gitgud.io (api + write_repository) and add it to repo secrets"; exit 1; }
+          [ -n "${GITLAB_TOKEN_NAME}" ] || { echo "::error::Secret GITGUD_TOKEN_NAME missing - your gitgud.io username"; exit 1; }
           BN=$(printf '%s' "${BRANCH_INPUT}" | tr -d '[:space:]')
           [ -n "${BN}" ] || BN=a16
           echo "BRANCH_NAME=${BN}" >> "$GITHUB_ENV"
-          GL_USER=$(curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" "https://gitlab.com/api/v4/user" | jq -r '.username // empty')
-          [ -n "${GL_USER}" ] || { echo "::error::GITLAB_TOKEN invalid - needs api+write_repository scopes"; exit 1; }
+          GL_USER=$(curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" "https://gitgud.io/api/v4/user" | jq -r '.username // empty')
+          [ -n "${GL_USER}" ] || { echo "::error::GITGUD_TOKEN invalid - needs a gitgud.io PAT with api scope"; exit 1; }
           echo "GitLab user: ${GL_USER}"
           PROJECT="${PROJECT_NAME_IN}"
           [ -n "${PROJECT}" ] || PROJECT="android_dump_infinix_x6886"
@@ -307,68 +307,43 @@ jobs:
             echo "- Build: BP2A.250605.031.A3 | Android 16"
             echo "- Platform: mt6789 | Kernel 6.12.38"
             echo ""
-            echo "## Structure (split across 5 projects - GitLab per-project quota)"
-            echo "- images/ - small + critical images (boot, vendor_boot, dtbo, vbmeta x3, md1img modem, lk, gz, tee, scp, preloader_raw, dpm, mcupm, pi_img, spmfw, sspm, tkv) + kernel + dtb"
-            echo "- system/ system_ext/ vendor/ product/ odm/ vendor_dlkm/ odm_dlkm/ system_dlkm/ - fully extracted EROFS partitions (real contents, real sizes)"
+            echo "## Structure - ONE repo (GitGud - no 10GiB wall)"
+            echo "- images/ - ALL 35 partition images + kernel + dtb (raw, real sizes)"
+            echo "- system/ system_ext/ vendor/ product/ odm/ vendor_dlkm/ odm_dlkm/ system_dlkm/ tr_*/ - every partition fully extracted (real contents)"
             echo "- ramdisks/ - boot + vendor_boot + init_boot unpacked with every ramdisk extracted (magic-byte detection)"
             echo "- aosp-device-tree/ - auto-generated device tree (review and refine manually)"
             echo "- device_info/ + proprietary-files-list.txt + complete_dump_manifest.txt"
-            echo ""
-            echo "Raw partition images live in the sibling projects:"
-            echo "- ${PROJECT}_imgs_system (system.img, system_ext.img, system_dlkm.img)"
-            echo "- ${PROJECT}_imgs_vendor (vendor.img, vendor_dlkm.img, product.img, odm.img, odm_dlkm.img)"
-            echo "- ${PROJECT}_imgs_tr (tr_region.img, tr_product.img, tr_preload.img, ...) raw"
-            echo "- ${PROJECT}_tr_extracted (extracted contents of every tr_* partition)"
           } > README.md
 
-      - name: Stage 10 - Smart organize with MOVES (zero duplication, real sizes) + split staging for the storage quota
+      - name: Stage 10 - Smart organize into ONE tree with MOVES (zero duplication, real sizes)
         run: |
           set +e
           cd workspace/extracted
-          echo "=== SMART ORGANIZE - MOVE not copy (every file uploaded ONCE at its REAL size) ==="
-          mkdir -p images ramdisks device_info _split/imgs_system _split/imgs_vendor _split/imgs_tr _split/tr_extracted
-
-          echo "--- [1/6] Small + critical images -> images/ (stay in the MAIN project) ---"
-          for f in boot.img vendor_boot.img init_boot.img dtbo.img vbmeta.img vbmeta_system.img vbmeta_vendor.img recovery.img lk.img logo.img tee.img scp.img md1img.img preloader_raw.img gz.img dpm.img mcupm.img pi_img.img spmfw.img sspm.img tkv.img; do
-            [ -f "$f" ] && mv -v "$f" images/ || true
-          done
+          echo "=== SMART ORGANIZE - ONE repo, MOVE not copy (real sizes) ==="
+          mkdir -p images ramdisks device_info
+          echo "--- [1/5] ALL partition images -> images/ (one home for every img) ---"
+          for f in *.img; do [ -f "$f" ] && mv -v "$f" images/ || true; done
           [ -f boot/kernel ] && cp boot/kernel images/kernel || true
           [ -f vendor_boot/kernel ] && cp vendor_boot/kernel images/vendor_boot_kernel || true
           [ -f boot/dtb ] && cp boot/dtb images/dtb || true
           [ -f vendor_boot/dtb ] && cp vendor_boot/dtb images/vendor_dtb || true
-          find vendor_boot ramdisks -name "*.dtb" -exec cp {} images/ \; 2>/dev/null || true
-
-          echo "--- [2/6] BIG raw images -> split staging (each split project stays under the per-project quota) ---"
-          for f in system.img system_ext.img system_dlkm.img; do [ -f "$f" ] && mv -v "$f" _split/imgs_system/ || true; done
-          for f in vendor.img vendor_dlkm.img product.img odm.img odm_dlkm.img; do [ -f "$f" ] && mv -v "$f" _split/imgs_vendor/ || true; done
-          for f in tr_region.img tr_product.img tr_preload.img tr_carrier.img tr_company.img tr_manifest.img tr_misc.img tr_overlayfs.img; do [ -f "$f" ] && mv -v "$f" _split/imgs_tr/ || true; done
-
-          echo "--- [3/6] Extracted tr_* contents -> their own split project ---"
-          for d in tr_region tr_product tr_preload tr_carrier tr_company tr_manifest tr_misc tr_overlayfs; do
-            [ -d "$d" ] && mv -v "$d" _split/tr_extracted/ || true
-          done
-
-          echo "--- [4/6] boot folders -> ramdisks/ (moved - zero copies) ---"
+          find vendor_boot -name "*.dtb" -exec cp {} images/ \; 2>/dev/null || true
+          echo "--- [2/5] boot folders -> ramdisks/ ---"
           for img in boot vendor_boot init_boot; do
             [ -d "$img" ] && mv -v "$img" ramdisks/ 2>/dev/null || true
           done
-
-          echo "--- [5/6] device info + props + proprietary list (text list, not duplicate copies) ---"
+          echo "--- [3/5] device info + props ---"
           cp device-info.txt device_info/ 2>/dev/null || true
-          find . -maxdepth 6 -name "*.prop" -not -path "./_split/*" 2>/dev/null | while read -r f; do cp --parents "$f" device_info/ 2>/dev/null || true; done
+          find . -maxdepth 6 -name "*.prop" -not -path "./ramdisks/*" 2>/dev/null | while read -r f; do cp --parents "$f" device_info/ 2>/dev/null || true; done
+          echo "--- [4/5] proprietary list (text - no duplicate copies) ---"
           find vendor vendor_dlkm odm odm_dlkm product system_ext -type f \( -name "*.so" -o -name "*.ko" -o -name "*.bin" -o -name "*.rc" \) 2>/dev/null | sort > proprietary-files-list.txt || true
-
-          echo "--- [6/6] READMEs + honest manifest with REAL sizes ---"
-          echo "# X6886 XOS 16 raw images - system family (system / system_ext / system_dlkm) - extract: fsck.erofs --extract=out file.img" > _split/imgs_system/README.md
-          echo "# X6886 XOS 16 raw images - vendor family (vendor / product / odm / *_dlkm)" > _split/imgs_vendor/README.md
-          echo "# X6886 XOS 16 raw Transsion tr_* partition images (region, product, preload, ...)" > _split/imgs_tr/README.md
-          echo "# X6886 XOS 16 - extracted contents of every tr_* partition" > _split/tr_extracted/README.md
+          echo "--- [5/5] honest manifest (real sizes) ---"
           {
-            echo "=== COMPLETE X6886 DUMP MANIFEST (zero duplication - every file uploaded once at real size) ==="
+            echo "=== COMPLETE X6886 DUMP MANIFEST (ONE repo - zero duplication - real sizes) ==="
             echo "Device: Infinix Hot 60 Pro Plus (X6886) | Build BP2A.250605.031.A3 | Android 16"
             echo "Date: $(date -u)"
             echo ""
-            for d in images ramdisks device_info aosp-device-tree system system_ext vendor product odm vendor_dlkm odm_dlkm system_dlkm _split/imgs_system _split/imgs_vendor _split/imgs_tr _split/tr_extracted; do
+            for d in images ramdisks device_info aosp-device-tree system system_ext vendor product odm vendor_dlkm odm_dlkm system_dlkm tr_region tr_product tr_preload; do
               [ -d "$d" ] && echo "$d/: $(find "$d" -type f 2>/dev/null | wc -l) files, $(du -sh "$d" 2>/dev/null | cut -f1)"
             done
             echo ""
@@ -379,144 +354,90 @@ jobs:
             find . -type f -not -path './.git/*' | sort
           } > complete_dump_manifest.txt
           head -25 complete_dump_manifest.txt || true
-          echo "--- Split sizes (each stays comfortably under the per-project quota) ---"
-          du -sh _split/imgs_system _split/imgs_vendor _split/imgs_tr _split/tr_extracted 2>/dev/null || true
-          echo "Main project size: $(find . -path ./_split -prune -o -type f -print0 2>/dev/null | du -ch --files0-from=- 2>/dev/null | tail -1 | cut -f1)"
+          echo "Total size to push: $(du -sh . 2>/dev/null | cut -f1) (ONE repo - GitGud has no 10GiB wall)"
           exit 0
 
-      - name: Stage 11 - Create/reuse FIVE GitLab projects + force PUBLIC visibility
+      - name: Stage 11 - Create/reuse the ONE GitGud project + force PUBLIC
         run: |
           set -euo pipefail
-          GENC=""; NS_ARG=""
+          NS_ARG=""
           if [ -n "${GITLAB_GROUP}" ]; then
             GENC=$(printf '%s' "${GITLAB_GROUP}" | jq -sRr @uri)
-            NS_ID=$(curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" "https://gitlab.com/api/v4/groups/${GENC}" | jq -r '.id // empty')
+            NS_ID=$(curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" "https://gitgud.io/api/v4/groups/${GENC}" | jq -r '.id // empty')
             [ -n "${NS_ID}" ] && NS_ARG="--data-urlencode namespace_id=${NS_ID}"
-            [ -n "${NS_ID}" ] || echo "::warning::Group ${GITLAB_GROUP} not found - projects go to your personal namespace"
+            [ -n "${NS_ID}" ] || echo "::notice::No group set - using your personal namespace on gitgud (simplest)"
           fi
-          ensure_project() {
-            local name="$1" slug pid papi cur penc benc
-            curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X POST "https://gitlab.com/api/v4/projects" \
-              --data-urlencode "name=${name}" --data-urlencode "path=${name}" \
-              --data-urlencode "visibility=public" --data-urlencode "lfs_enabled=true" ${NS_ARG} > repo.json 2>/dev/null || true
-            pid=$(jq -r '.id // empty' repo.json)
-            slug=$(jq -r '.path_with_namespace // empty' repo.json)
-            if [ -z "${slug}" ]; then
-              penc=$(printf '%s' "${name}" | jq -sRr @uri)
-              curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" "https://gitlab.com/api/v4/projects?membership=true&simple=true&per_page=100&search=${penc}" > list.json 2>/dev/null || true
-              pid=$(jq -r --arg p "${name}" '[.[] | select(.path==$p)][0].id // empty' list.json)
-              slug=$(jq -r --arg p "${name}" '[.[] | select(.path==$p)][0].path_with_namespace // empty' list.json)
-            fi
-            if [ -z "${slug}" ] || [ -z "${pid}" ]; then
-              echo "::error::Could not create/find project ${name}" >&2
-              cat repo.json >&2 || true
-              return 1
-            fi
-            papi="https://gitlab.com/api/v4/projects/${pid}"
-            curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X PUT "${papi}" --data-urlencode "visibility=public" --data-urlencode "lfs_enabled=true" > vis.json 2>/dev/null || true
-            cur=$(jq -r '.visibility // empty' vis.json)
-            if [ "${cur}" != "public" ] && [ -n "${GENC}" ]; then
-              echo "::warning::${name} is '${cur}' - group is restricting it; making the GROUP public and retrying" >&2
-              curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X PUT "https://gitlab.com/api/v4/groups/${GENC}" --data-urlencode "visibility=public" > /dev/null 2>&1 || true
-              curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X PUT "${papi}" --data-urlencode "visibility=public" > vis.json 2>/dev/null || true
-              cur=$(jq -r '.visibility // empty' vis.json)
-            fi
-            echo "PROJECT ${name}: ${slug} (id ${pid}) visibility=${cur:-unknown}" >&2
-            [ "${cur}" = "public" ] || echo "::warning::${name} is STILL not public - check group/instance settings" >&2
-            benc=$(printf '%s' "${BRANCH_NAME}" | jq -sRr @uri)
-            curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X DELETE "${papi}/protected_branches/${benc}" > /dev/null 2>&1 || true
-            printf '%s' "${slug}"
-          }
-          MAIN_SLUG=$(ensure_project "${PROJECT}")
-          echo "MAIN_SLUG=${MAIN_SLUG}" >> "$GITHUB_ENV"
-          A_SLUG=$(ensure_project "${PROJECT}_imgs_system")
-          echo "A_SLUG=${A_SLUG}" >> "$GITHUB_ENV"
-          B_SLUG=$(ensure_project "${PROJECT}_imgs_vendor")
-          echo "B_SLUG=${B_SLUG}" >> "$GITHUB_ENV"
-          TR_SLUG=$(ensure_project "${PROJECT}_imgs_tr")
-          echo "TR_SLUG=${TR_SLUG}" >> "$GITHUB_ENV"
-          TRX_SLUG=$(ensure_project "${PROJECT}_tr_extracted")
-          echo "TRX_SLUG=${TRX_SLUG}" >> "$GITHUB_ENV"
-          echo "All 5 projects ready and PUBLIC"
+          curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X POST "https://gitgud.io/api/v4/projects" \
+            --data-urlencode "name=${PROJECT}" --data-urlencode "path=${PROJECT}" \
+            --data-urlencode "visibility=public" --data-urlencode "lfs_enabled=true" ${NS_ARG} > repo.json 2>/dev/null || true
+          PID=$(jq -r '.id // empty' repo.json)
+          SLUG=$(jq -r '.path_with_namespace // empty' repo.json)
+          if [ -z "${SLUG}" ]; then
+            PENC=$(printf '%s' "${PROJECT}" | jq -sRr @uri)
+            curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" "https://gitgud.io/api/v4/projects?membership=true&simple=true&per_page=100&search=${PENC}" > list.json 2>/dev/null || true
+            PID=$(jq -r --arg p "${PROJECT}" '[.[] | select(.path==$p)][0].id // empty' list.json)
+            SLUG=$(jq -r --arg p "${PROJECT}" '[.[] | select(.path==$p)][0].path_with_namespace // empty' list.json)
+          fi
+          [ -n "${SLUG}" ] && [ -n "${PID}" ] || { echo "::error::Could not create/find the GitGud project"; cat repo.json; exit 1; }
+          PAPI="https://gitgud.io/api/v4/projects/${PID}"
+          curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X PUT "${PAPI}" --data-urlencode "visibility=public" --data-urlencode "lfs_enabled=true" > vis.json 2>/dev/null || true
+          echo "Visibility: $(jq -r '.visibility // \"?\"' vis.json)"
+          BENC=$(printf '%s' "${BRANCH_NAME}" | jq -sRr @uri)
+          curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X DELETE "${PAPI}/protected_branches/${BENC}" > /dev/null 2>&1 || true
+          echo "GITLAB_SLUG=${SLUG}" >> "$GITHUB_ENV"
+          echo "GITLAB_PID=${PID}" >> "$GITHUB_ENV"
+          echo "Project ready: https://gitgud.io/${SLUG} (id ${PID})"
 
-      - name: Stage 12 - Push FIVE split projects (LFS auto >100MB, 3 retries each, HONEST report - no fake success)
+      - name: Stage 12 - Push EVERYTHING to the ONE GitGud repo (aggressive LFS, 3 retries, HONEST result)
         run: |
           set +e
           cd workspace/extracted
-          REPORT="$GITHUB_WORKSPACE/push_report.txt"
-          : > "$REPORT"
-          push_dir() {
-            local pname="$1" slug="$2" dir="$3" msg="$4"
-            local size rc i
-            if [ "$dir" = "." ]; then
-              size=$(find . -path ./_split -prune -o -type f -not -path './.git/*' -print0 2>/dev/null | du -ch --files0-from=- 2>/dev/null | tail -1 | cut -f1)
-            else
-              size=$(du -sh "$dir" 2>/dev/null | cut -f1)
-            fi
-            echo ""
-            echo "=== PUSH [${pname}] -> ${slug} (${size}) ==="
-            rc=1
-            for i in 1 2 3; do
-              (
-                set -e
-                cd "$dir"
-                rm -rf .git .gitattributes
-                git init -q -b "${BRANCH_NAME}"
-                git lfs install --local > /dev/null 2>&1 || true
-                git config user.name "${{ github.actor }}"
-                git config user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
-                git config http.postBuffer 2097152000
-                git config http.version HTTP/1.1
-                git config core.compression 9
-                git config pack.threads 0
-                git config index.threads 0
-                git config gc.auto 0
-                find . -path ./_split -prune -o -type f -size +100M -print0 2>/dev/null | xargs -0 -r git lfs track > /dev/null 2>&1 || true
-                [ -f .gitattributes ] && git add .gitattributes
-                git remote add origin "https://${GITLAB_TOKEN_NAME}:${GITLAB_TOKEN}@gitlab.com/${slug}.git"
-                git add -A
-                git commit -qsm "${msg}" || true
-                git push --force -u origin "${BRANCH_NAME}"
-              )
-              rc=$?
-              [ "$rc" -eq 0 ] && break
-              echo "::warning::[${pname}] push attempt ${i} failed - retrying in 30s"
-              sleep 30
-            done
-            if [ "$rc" -eq 0 ]; then
-              echo "${pname}|${slug}|OK|${size}" >> "$REPORT"
-              echo "=== [${pname}] PUSHED OK (${size}) ==="
-            else
-              echo "${pname}|${slug}|FAILED|${size}" >> "$REPORT"
-              echo "::error::[${pname}] push FAILED after 3 attempts"
-            fi
-          }
-          echo "_split/" > .gitignore
-          push_dir "main - extracted partitions + small images + ramdisks + device tree" "${MAIN_SLUG}" "." "x6886: XOS 16 ${BUILD_ID} - extracted partitions + device tree + ramdisks + small images"
-          push_dir "imgs_system - raw system family images" "${A_SLUG}" "_split/imgs_system" "x6886: raw images - system/system_ext/system_dlkm"
-          push_dir "imgs_vendor - raw vendor family images" "${B_SLUG}" "_split/imgs_vendor" "x6886: raw images - vendor/product/odm/dlkm"
-          push_dir "imgs_tr - raw tr_* images" "${TR_SLUG}" "_split/imgs_tr" "x6886: raw images - transsion tr_region/tr_product/tr_*"
-          push_dir "tr_extracted - extracted tr_* contents" "${TRX_SLUG}" "_split/tr_extracted" "x6886: extracted tr_* partition contents"
-          echo ""
-          echo "=== HONEST PUSH REPORT (what ACTUALLY happened) ==="
-          cat "$REPORT"
-          MENC=$(printf '%s' "${MAIN_SLUG}" | sed 's|/|%2F|g')
-          curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X PUT "https://gitlab.com/api/v4/projects/${MENC}" \
-            --data-urlencode "default_branch=${BRANCH_NAME}" \
-            --data-urlencode "description=Complete XOS 16 dump - Infinix Hot 60 Pro Plus (X6886) - ${BUILD_ID} - extracted partitions + device tree + ramdisks + small images. Raw images in sibling projects: _imgs_system / _imgs_vendor / _imgs_tr / _tr_extracted" \
-            --data-urlencode "topics=infinix,x6886,android16,firmware,dump,mt6789" > /dev/null 2>&1 || true
-          if grep -q "FAILED" "$REPORT"; then
-            echo "::error::At least one project FAILED to push - the report above says exactly which one"
+          rm -rf .git .gitattributes .gitignore
+          git init -q -b "${BRANCH_NAME}"
+          git lfs install --local
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
+          git config http.postBuffer 2097152000
+          git config http.version HTTP/1.1
+          git config core.compression 9
+          git config pack.threads 0
+          git config index.threads 0
+          git config gc.auto 0
+          # Aggressive LFS - every heavy/binary type via LFS (per-object uploads, proven 158MB/s here) so the plain git pack stays small and send-pack never dies mid-POST
+          git lfs track "*.img" "*.so" "*.apk" "*.apex" "*.bin" "*.dat" "*.ko" "*.vdex" "*.odex" "*.art" "*.arsc" "*.pak" "*.ttf" "*.otf" "*.jar" "*.zip" "*.gz" "*.zst" "*.br" "*.xz" "*.lz4" "*.cpio" "*.dtb" "*.fw" "*.elf" "*.ogg" "*.wav" "*.mp3" "*.mp4" "*.pb" "*.tflite" "*.webp" > /dev/null 2>&1 || true
+          find . -type f -size +50M -not -path "./.git/*" -print0 2>/dev/null | xargs -0 -r git lfs track > /dev/null 2>&1 || true
+          [ -f .gitattributes ] && git add .gitattributes
+          git remote add origin "https://${GITLAB_TOKEN_NAME}:${GITLAB_TOKEN}@gitgud.io/${GITLAB_SLUG}.git"
+          git add -A
+          git commit -qsm "x6886: complete XOS 16 dump ${BUILD_ID} - EVERYTHING in ONE repo: all images + every partition extracted + ramdisks + device tree" || true
+          TOTAL=$(find . -type f -not -path './.git/*' 2>/dev/null | wc -l)
+          SIZE=$(du -sh --exclude=.git . 2>/dev/null | cut -f1)
+          echo "Pushing ${TOTAL} files (${SIZE}) to https://gitgud.io/${GITLAB_SLUG} branch ${BRANCH_NAME} ..."
+          rc=1
+          for i in 1 2 3; do
+            if git push --force -u origin "${BRANCH_NAME}"; then rc=0; break; fi
+            echo "::warning::push attempt ${i} failed - retrying in 30s"
+            sleep 30
+          done
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Push FAILED after 3 attempts - honest failure, nothing was uploaded"
+            echo "RESULT=FAILED" >> "$GITHUB_ENV"
             exit 1
           fi
-          echo "ALL 5 PROJECTS PUSHED OK - honest success"
+          echo "RESULT=OK" >> "$GITHUB_ENV"
+          PAPI="https://gitgud.io/api/v4/projects/${GITLAB_PID}"
+          curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X PUT "${PAPI}" \
+            --data-urlencode "default_branch=${BRANCH_NAME}" \
+            --data-urlencode "description=Complete XOS 16 dump - Infinix Hot 60 Pro Plus (X6886) - ${BUILD_ID} - ONE repo: all raw images (images/) + every partition extracted (real sizes) + ramdisks + auto device tree + full manifest" \
+            --data-urlencode "topics=infinix,x6886,android16,firmware,dump,mt6789" > /dev/null 2>&1 || true
+          echo "PUSHED OK - https://gitgud.io/${GITLAB_SLUG} branch ${BRANCH_NAME} (${TOTAL} files, ${SIZE}) - honest success"
 
       - name: Job summary
         if: always()
         run: |
           cd workspace/extracted 2>/dev/null || true
           {
-            echo "### X6886 Complete Dump - Infinix Hot 60 Pro Plus"
+            echo "### X6886 Complete Dump - Infinix Hot 60 Pro Plus (ONE repo on GitGud)"
             echo ""
             echo "| Field | Value |"
             echo "| --- | --- |"
@@ -526,16 +447,6 @@ jobs:
             echo "| Build | BP2A.250605.031.A3 |"
             echo "| Branch | ${BRANCH_NAME} |"
             echo "| Total files | $(find . -type f -not -path './.git/*' 2>/dev/null | wc -l) |"
-            echo ""
-            echo "### Push report - what ACTUALLY happened (no fake success)"
-            echo ""
-            echo "| Project | Status | Size | Link |"
-            echo "| --- | --- | --- | --- |"
+            echo "| Result | ${RESULT:-did not reach push} |"
+            echo "| GitGud | https://gitgud.io/${GITLAB_SLUG:-} |"
           } >> "$GITHUB_STEP_SUMMARY"
-          if [ -f "$GITHUB_WORKSPACE/push_report.txt" ]; then
-            while IFS='|' read -r pname pslug pstatus psize; do
-              echo "| ${pname} | ${pstatus} | ${psize} | https://gitlab.com/${pslug} |" >> "$GITHUB_STEP_SUMMARY"
-            done < "$GITHUB_WORKSPACE/push_report.txt"
-          else
-            echo "| - | run ended before the push stage | - | - |" >> "$GITHUB_STEP_SUMMARY"
-          fi
