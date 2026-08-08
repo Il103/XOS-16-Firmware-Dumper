@@ -1,0 +1,142 @@
+name: "Android Full Dump (our own tools) -> GitLab"
+
+on:
+  workflow_dispatch:
+    inputs:
+      FIRMWARE_LINK:
+        description: "Direct link to the FULL A/B OTA zip"
+        required: true
+        default: "https://android.googleapis.com/packages/ota-api/package/837bf8fe0e8aba315b5972a23c78366bfa0744fc.zip"
+      BRANCH_NAME:
+        description: "GitLab branch for this dump"
+        required: true
+        default: "a16"
+      GITLAB_HOST:
+        description: "GitLab host"
+        required: true
+        default: "gitlab.com"
+      GITLAB_GROUP:
+        description: "GitLab group / namespace (leave EMPTY to use your personal namespace)"
+        required: false
+        default: ""
+      PROJECT_NAME:
+        description: "GitLab project name"
+        required: true
+        default: "android_dump_infinix_x6886"
+      VISIBILITY:
+        description: "GitLab project visibility"
+        required: true
+        type: choice
+        default: "public"
+        options: ["public", "internal", "private"]
+      KEEP_BIG_IMAGES:
+        description: "Also push the huge raw filesystem images (system/vendor/...)"
+        required: true
+        type: choice
+        default: "false"
+        options: ["false", "true"]
+      RESET_BRANCH:
+        description: "Ignore resume state and rebuild this branch from scratch"
+        required: true
+        type: choice
+        default: "false"
+        options: ["false", "true"]
+
+concurrency:
+  group: android-dump-${{ inputs.PROJECT_NAME }}-${{ inputs.BRANCH_NAME }}
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: "1"
+  BRAND: "infinix"
+  CODENAME: "x6886"
+  MODEL: "Infinix Hot 60 Pro Plus"
+  BUILD_ID: "BP2A.250605.031.A3"
+  FINGERPRINT: "Infinix/X6886-OP/Infinix-X6886:16/BP2A.250605.031.A3/301400007:user/release-keys"
+  PLATFORM: "mt6789"
+  ANDROID_VER: "16"
+  KERNEL_VER: "6.12.38"
+
+jobs:
+  dump:
+    name: "dump -> ${{ inputs.PROJECT_NAME }} / ${{ inputs.BRANCH_NAME }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: "Checkout our tools"
+        uses: actions/checkout@v4
+
+      - name: "00 - Preflight (token + GitLab account + device lock)"
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          GITLAB_HOST: ${{ inputs.GITLAB_HOST }}
+          BRANCH_NAME: ${{ inputs.BRANCH_NAME }}
+        run: bash tools/lib/preflight.sh
+
+      - name: "01 - Free disk and pick the biggest volume as workspace"
+        run: bash tools/lib/env_setup.sh
+
+      - name: "02 - Install extraction tools"
+        run: bash tools/lib/install_deps.sh
+
+      - name: "03 - Self-check our own tools before touching 8 GB"
+        run: bash tools/lib/selfcheck.sh
+
+      - name: "04 - TOOL 01 - download and verify the OTA"
+        env:
+          LINK: ${{ inputs.FIRMWARE_LINK }}
+        run: |
+          bash "$TOOLS/01_fetch.sh" "$LINK" "$DL/ota.zip"
+          cp -f "$DL/ota_metadata.txt" "$DUMP/ota_metadata.txt" 2>/dev/null || true
+          df -h "$DL"
+
+      - name: "05 - TOOL 02 - payload.bin to every raw partition image"
+        run: |
+          echo ">> what is inside the payload:"
+          python3 "$TOOLS/02_payload_extract.py" "$DL/ota.zip" "$RAW" --list
+          echo ">> extracting - one live line per partition, nothing buffered:"
+          python3 "$TOOLS/02_payload_extract.py" "$DL/ota.zip" "$RAW"
+          ls -lhS "$RAW"
+          rm -f "$DL/ota.zip"
+          echo ">> OTA zip deleted, disk now:"
+          df -h "$RAW"
+
+      - name: "06 - TOOL 03 + TOOL 04 - boot images to kernel, dtb and ramdisks (incl. recovery)"
+        run: bash tools/lib/boot_stage.sh
+
+      - name: "07 - TOOL 05 - filesystem images to real files (standard dump layout)"
+        env:
+          KEEP_BIG_IMAGES: ${{ inputs.KEEP_BIG_IMAGES }}
+        run: bash tools/lib/fs_stage.sh
+
+      - name: "08 - TOOL 06 - dump metadata (all_files.txt, board-info.txt, README.md, kernel config)"
+        run: |
+          bash "$TOOLS/06_dump_meta.sh" "$DUMP"
+          echo "-------------------- README.md --------------------"
+          cat "$DUMP/README.md"
+
+      - name: "09 - Create or reuse the GitLab project"
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          GITLAB_HOST: ${{ inputs.GITLAB_HOST }}
+          GITLAB_GROUP: ${{ inputs.GITLAB_GROUP }}
+          PROJECT_NAME: ${{ inputs.PROJECT_NAME }}
+          VISIBILITY: ${{ inputs.VISIBILITY }}
+        run: bash tools/lib/gitlab_project.sh
+
+      - name: "10 - TOOL 07 - resumable per-partition push to GitLab"
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          GITLAB_HOST: ${{ inputs.GITLAB_HOST }}
+          BRANCH_NAME: ${{ inputs.BRANCH_NAME }}
+          RESET_BRANCH: ${{ inputs.RESET_BRANCH }}
+          GIT_AUTHOR: "x6886-dumper"
+          GIT_EMAIL: "berucrypt02@gmail.com"
+        run: bash "$TOOLS/07_gitlab_push.sh" "$DUMP"
+
+      - name: "Summary (always honest, even on failure)"
+        if: always()
+        env:
+          BRANCH_NAME: ${{ inputs.BRANCH_NAME }}
+        run: bash tools/lib/summary.sh
