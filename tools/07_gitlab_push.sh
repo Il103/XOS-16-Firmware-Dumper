@@ -4,14 +4,14 @@
 # Fixed in this version:
 #  1. LFS is used ONLY for files bigger than LFS_MIN_MB (default 95 MB), matched
 #     by exact path. The old version tracked by EXTENSION (*.so *.apk *.ko ...)
-#     which pushed thousands of small files into LFS - and GitLab renders an LFS
+#     so thousands of small files became LFS objects - and GitLab shows an LFS
 #     file as a 3-line pointer, which is why the dump did not look like a dump.
-#  2. A failed push is now diagnosed instead of blindly repeated. On
-#     "cannot lock ref" / "fetch first" we fetch, and either recognise that the
-#     commit already landed, or re-anchor our commit on top of the real remote head.
-#  3. FRESH_BRANCH=true deletes the remote branch through the GitLab API and
-#     starts the branch over from nothing.
-#  4. Raw partition images live in images/ instead of being dumped at the root.
+#  2. A rejected push is now diagnosed instead of blindly repeated. On
+#     "cannot lock ref" / "fetch first" we fetch and either recognise that our
+#     commit already landed, or re-anchor it on top of the real remote head.
+#  3. RESET_BRANCH=true (or FRESH_BRANCH=true) DELETES the remote branch through
+#     the GitLab API and builds it again from zero.
+#  4. Raw partition images live in images/ instead of littering the root.
 #
 # usage: 07_gitlab_push.sh <dumpdir>
 set -uo pipefail
@@ -48,34 +48,37 @@ git_setup() {
   git lfs install --local >/dev/null 2>&1 || true
 }
 
-# ---------------- FRESH_BRANCH: literally delete the old branch ----------------
-if [ "${FRESH_BRANCH:-false}" = "true" ]; then
-  echo "=== FRESH_BRANCH=true - deleting branch '${BR}' on ${HOST} and starting clean ==="
+# ---------------- start the branch over, literally ----------------
+FRESH="false"
+if [ "${FRESH_BRANCH:-false}" = "true" ] || [ "${RESET_BRANCH:-false}" = "true" ]; then
+  FRESH="true"
+fi
+FORCE_PUSH=0
+
+if [ "$FRESH" = "true" ]; then
+  echo "=== FRESH START: deleting branch '${BR}' on ${HOST} and rebuilding it from zero ==="
   code=$(curl -sS -o /tmp/delbr.txt -w '%{http_code}' -X DELETE \
     --header "PRIVATE-TOKEN: ${TOK}" \
     "${API}/projects/${PID}/repository/branches/${BR}" 2>/dev/null || echo 000)
   case "$code" in
     204|202) echo ">> branch '${BR}' deleted" ;;
-    404)     echo ">> branch '${BR}' did not exist - nothing to delete" ;;
-    *)       echo "::warning::branch delete returned HTTP ${code}: $(head -c 300 /tmp/delbr.txt)" ;;
+    404)     echo ">> branch '${BR}' did not exist yet - nothing to delete" ;;
+    *)       echo "::warning::branch delete returned HTTP ${code}: $(head -c 300 /tmp/delbr.txt 2>/dev/null)" ;;
   esac
-  # a protected default branch cannot be deleted - say so honestly
+  sleep 4
   if curl -sS --header "PRIVATE-TOKEN: ${TOK}" \
        "${API}/projects/${PID}/repository/branches/${BR}" 2>/dev/null | grep -q '"name"'; then
-    echo "::warning::branch '${BR}' still exists (probably protected or it is the default branch)."
-    echo "::warning::history will be replaced with a force push instead."
+    echo "::warning::branch '${BR}' still exists (protected, or it is the default branch)."
+    echo "::warning::its history will be REPLACED with a force push instead."
     FORCE_PUSH=1
   fi
   rm -f "$STATE"
   rm -rf .git
-  sleep 5
 fi
-FORCE_PUSH="${FORCE_PUSH:-0}"
 
 # ---------------- resume, or start a new history ----------------
 if [ ! -d .git ]; then
-  if [ "${FRESH_BRANCH:-false}" != "true" ] && [ "${RESET_BRANCH:-false}" != "true" ] \
-     && git ls-remote --heads "$REMOTE" "$BR" 2>/dev/null | grep -q .; then
+  if [ "$FRESH" != "true" ] && git ls-remote --heads "$REMOTE" "$BR" 2>/dev/null | grep -q .; then
     echo ">> RESUME: branch '$BR' exists on ${HOST} - continuing the SAME dump"
     if git clone --no-checkout --filter=blob:none --depth=1 --branch "$BR" "$REMOTE" .gitclone >/dev/null 2>&1; then
       mv .gitclone/.git .git
@@ -103,8 +106,16 @@ git remote remove origin 2>/dev/null || true
 git remote add origin "$REMOTE"
 touch "$STATE" .gitattributes
 
+# a .gitattributes inherited from the old runs turned every .so/.apk/.ko into an
+# LFS pointer - drop those extension rules so real file content is stored again
+if grep -q '^\*' .gitattributes 2>/dev/null; then
+  echo ">> dropping legacy extension-based LFS rules from .gitattributes:"
+  grep '^\*' .gitattributes | sed 's/^/     - /'
+  grep -v '^\*' .gitattributes > .gitattributes.new 2>/dev/null || : > .gitattributes.new
+  mv .gitattributes.new .gitattributes
+fi
+
 # ---------------- LFS: ONLY genuinely huge files, by exact path ----------------
-# Everything else stays a normal git blob so GitLab shows real file contents.
 track_big_files() {
   local f line n=0
   while IFS= read -r -d '' f; do
@@ -114,11 +125,10 @@ track_big_files() {
     grep -qxF "$line" .gitattributes 2>/dev/null && continue
     printf '%s\n' "$line" >> .gitattributes
     n=$((n+1))
-    echo "   LFS (> ${LFS_MIN_MB}M): $f"
+    echo "   LFS (over ${LFS_MIN_MB}M): $f"
   done < <(find . -type f -size +"${LFS_MIN_MB}"M -not -path './.git/*' -print0 2>/dev/null)
-  if [ "$n" = 0 ]; then
-    echo "   no file above ${LFS_MIN_MB}M in this group - nothing goes to LFS"
-  fi
+  [ "$n" = 0 ] && echo "   no file above ${LFS_MIN_MB}M here - this group is pushed as normal browsable files"
+  return 0
 }
 
 storage_report() {
@@ -128,7 +138,7 @@ storage_report() {
   lo=$(printf '%s' "$j" | jq -r '.statistics.lfs_objects_size // 0' 2>/dev/null || echo 0)
   tot=$(( rs + lo ))
   echo "   GitLab storage: repo $(( rs / 1048576 ))MB + LFS $(( lo / 1048576 ))MB = $(( tot / 1048576 ))MB"
-  echo "   (GitLab statistics lag a few minutes - a small number right after a push is normal)"
+  echo "   (these numbers lag several minutes - a small value right after a push is normal)"
   if [ "$tot" -gt 9663676416 ]; then
     echo "::warning::past 9 GiB - free gitlab.com projects are capped at 10 GiB"
   fi
@@ -136,44 +146,44 @@ storage_report() {
 
 # ---------------- a push that actually recovers ----------------
 push_now() {
-  local name="$1" i rc=1 remote_sha local_sha out
+  local name="$1" i rc=1 remote_sha local_sha
   for i in 1 2 3 4; do
-    if [ "$FORCE_PUSH" = "1" ] && [ "$i" = 1 ]; then
-      echo "   (force push: replacing remote history for '${BR}')"
-      git push --force origin "HEAD:refs/heads/${BR}" && { rc=0; FORCE_PUSH=0; break; }
+    if [ "$FORCE_PUSH" = "1" ]; then
+      echo "   (force push: replacing remote history of '${BR}')"
+      if git push --force origin "HEAD:refs/heads/${BR}"; then rc=0; FORCE_PUSH=0; break; fi
     else
-      git push origin "HEAD:refs/heads/${BR}" && { rc=0; break; }
+      if git push origin "HEAD:refs/heads/${BR}"; then rc=0; break; fi
     fi
 
-    echo "::warning::[$name] push attempt ${i} was rejected - asking the server what it really has"
+    echo "::warning::[$name] push attempt ${i} rejected - asking the server what it really has"
     git fetch --no-tags --force origin "refs/heads/${BR}:refs/remotes/origin/${BR}" 2>&1 | sed 's/^/     /' || true
     remote_sha=$(git rev-parse --verify -q "refs/remotes/origin/${BR}" || true)
     local_sha=$(git rev-parse HEAD)
 
     if [ -z "$remote_sha" ]; then
-      echo "     server has no '${BR}' yet - retrying"
+      echo "     the server has no '${BR}' at all - retrying"
       sleep 15
       continue
     fi
 
     if [ "$remote_sha" = "$local_sha" ] || git merge-base --is-ancestor "$local_sha" "$remote_sha" 2>/dev/null; then
-      echo "     GOOD NEWS: the server already contains our commit ${local_sha:0:8}."
-      echo "     That rejection was a GitLab ref-lock race, not a lost push."
+      echo "     GOOD NEWS: the server already contains our commit ${local_sha:0:8}"
+      echo "     that rejection was a GitLab ref-lock race, not a lost upload"
       git reset --soft "$remote_sha" >/dev/null 2>&1 || true
       git update-ref "refs/heads/${BR}" "$remote_sha" 2>/dev/null || true
       rc=0
       break
     fi
 
-    echo "     remote head is ${remote_sha:0:8}, ours is ${local_sha:0:8} - re-anchoring our work on top of the remote"
+    echo "     remote head ${remote_sha:0:8} vs ours ${local_sha:0:8} - re-anchoring our commit on top of the remote"
     if ! git reset --soft "$remote_sha" >/dev/null 2>&1; then
-      echo "::warning::     could not re-anchor - retrying plain push"
+      echo "::warning::     re-anchor failed - retrying a plain push"
       sleep 15
       continue
     fi
     git update-ref "refs/heads/${BR}" "$remote_sha" 2>/dev/null || true
     if ! git commit -qm "x6886: ${name}" 2>/dev/null; then
-      echo "     after re-anchoring there is nothing left to commit - this group is already on the server"
+      echo "     nothing left to commit after re-anchoring - this group is already on the server"
       rc=0
       break
     fi
@@ -188,7 +198,7 @@ push_group() {
   local name="$1"
   shift
   local paths=("$@")
-  local p any=0
+  local p any=0 sz
 
   if already_pushed "$name"; then
     echo ">> [$name] already on ${HOST} - skipped (resume)"
@@ -201,8 +211,9 @@ push_group() {
     return 0
   fi
 
+  sz=$(du -shc --exclude=.git "${paths[@]}" 2>/dev/null | tail -1 | cut -f1)
   echo
-  echo "=== [$name] staging $(du -sh --exclude=.git "${paths[@]}" 2>/dev/null | tail -1 | cut -f1) ==="
+  echo "=== [$name] staging ${sz} ==="
   track_big_files
   git add -- "${paths[@]}" 2>/dev/null || true
   echo "$name" >> "$STATE"
@@ -215,7 +226,7 @@ push_group() {
 
   if ! push_now "$name"; then
     echo "::error::[$name] PUSH FAILED. Everything pushed BEFORE this group is safe on ${HOST}."
-    echo "::error::Run this workflow again - it resumes at '${name}' and never redoes finished work."
+    echo "::error::Run the workflow again with RESET_BRANCH=false - it resumes at '${name}'."
     return 1
   fi
 
@@ -235,10 +246,10 @@ mapfile -t METAF < <(ls -1 README.md board-info.txt all_files.txt proprietary-fi
   ota_metadata.txt kernel_config.txt kernel_version.txt 2>/dev/null || true)
 if [ "${#METAF[@]}" -gt 0 ]; then push_group meta "${METAF[@]}" || exit 1; fi
 
-mapfile -t BOOTD < <(ls -1d boot vendor_boot init_boot recovery 2>/dev/null || true)
+mapfile -t BOOTD < <(ls -1d boot vendor_boot init_boot vendor_kernel_boot recovery 2>/dev/null || true)
 if [ "${#BOOTD[@]}" -gt 0 ]; then push_group boot "${BOOTD[@]}" || exit 1; fi
 
-[ -d images ] && { push_group images images || exit 1; }
+if [ -d images ]; then push_group images images || exit 1; fi
 
 mapfile -t DLKM < <(ls -1d vendor_dlkm odm_dlkm system_dlkm 2>/dev/null || true)
 if [ "${#DLKM[@]}" -gt 0 ]; then push_group dlkm "${DLKM[@]}" || exit 1; fi
