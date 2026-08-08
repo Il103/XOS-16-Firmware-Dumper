@@ -1,58 +1,92 @@
-# Our own dumper tools
+# Android Full Dump - our own tools
 
-Seven tools written from scratch. No DumprX, no magiskboot, no payload-dumper-go.
-Each one is a separate file on purpose, so a single broken stage can be fixed
-without touching anything else.
+No DumprX. No magiskboot. No payload-dumper-go. No Crave.
+Seven tools written from scratch, running on plain GitHub Actions (`ubuntu-latest`),
+pushing the dump to GitLab **one partition group at a time** so a dead runner never
+costs you the whole run.
 
-| # | File | What it does | Why we wrote our own |
-| --- | --- | --- | --- |
-| 01 | `01_fetch.sh` | Downloads the OTA with 16 connections, then proves it is a real FULL A/B OTA before anything else runs | old runs wasted 40 minutes before discovering a bad link |
-| 02 | `02_payload_extract.py` | Pure-python `payload.bin` extractor. Reads the payload in place out of a STORED zip, so there is no 8 GB copy | payload-dumper-go was banned, and DumprX deleted the images afterwards |
-| 03 | `03_bootimg_unpack.py` | Pure-python `ANDROID!` v0-v4 and `VNDRBOOT` v3/v4 parser, including the v4 vendor-ramdisk table | magiskboot died with `Illegal instruction (core dumped)` on this device |
-| 04 | `04_ramdisk_extract.sh` | Turns any ramdisk into real files: lz4_legacy, lz4, gzip, xz, zstd, lzma, bzip2, raw cpio | MTK ships lz4_legacy, most scripts only try gzip |
-| 05 | `05_unpack_fs.sh` | Routes each image by magic bytes: sparse, EROFS, ext4, f2fs, with real fallbacks | avoids the fake `7z failed` spam and keeps the raw image when extraction is impossible |
-| 06 | `06_dump_meta.sh` | `all_files.txt`, `board-info.txt`, `proprietary-files.txt`, `README.md`, kernel version and kernel config | the device uses Transsion MSSI props, so twrpdtgen crashed on `ro.product.system.device` |
-| 07 | `07_gitlab_push.sh` | Resumable per-partition commit and push, deletes the working copy after each group so the disk never fills | the old pipeline never finished, and a dead job lost everything |
+## The seven tools
+
+| # | File | What it does |
+|---|------|--------------|
+| 01 | `01_fetch.sh` | `aria2c` download, 16 connections. Verifies size, zip integrity, presence of `payload.bin`, and that the OTA is FULL and not incremental. Fails in the first minute instead of after two hours. |
+| 02 | `02_payload_extract.py` | Our own `payload.bin` extractor. Minimal protobuf reader, no third-party libs. Supports `REPLACE`, `REPLACE_BZ`, `REPLACE_XZ`, `ZERO`, `DISCARD`. Reads the payload **in place inside the zip** (no 8 GB copy) and writes `ZERO` extents as sparse holes. |
+| 03 | `03_bootimg_unpack.py` | Pure-Python reader for `boot` / `init_boot` / `vendor_boot`. `ANDROID!` v0-v4 and `VNDRBOOT` v3/v4, **including the v4 vendor ramdisk fragment table**, so `ramdisk` and `recovery_ramdisk` come out separately. This is exactly where magiskboot died with `Illegal instruction (core dumped)`. |
+| 04 | `04_ramdisk_extract.sh` | Any compressed ramdisk to real files: `lz4_legacy` (MediaTek), `lz4`, `gzip`, `xz`, `zstd`, `lzma`, `bzip2`, and raw cpio. |
+| 05 | `05_unpack_fs.sh` | Detects the filesystem from **magic bytes**, not from the filename: sparse -> `simg2img`, EROFS -> `fsck.erofs`, ext4/f2fs -> mount or `debugfs`, `7z` only as a last resort. On failure it keeps the raw image so nothing is ever lost. |
+| 06 | `06_dump_meta.sh` | Makes the tree look like a real dump: `all_files.txt`, `board-info.txt`, `README.md` with a size table, `proprietary-files.txt`, and `kernel_config.txt` recovered from the `IKCFG_ST` blob inside the kernel. |
+| 07 | `07_gitlab_push.sh` | The resumable uploader. Per group: `git add` -> commit -> push -> drop the files from the working copy -> clear the LFS cache -> read real project size from the GitLab API. |
 
 ## Glue (`lib/`)
 
-| File | What it does |
-| --- | --- |
-| `lib/preflight.sh` | refuses to start unless `GITLAB_TOKEN` actually works |
-| `lib/env_setup.sh` | frees the runner disk and picks the biggest volume as workspace |
-| `lib/install_deps.sh` | installs every extractor and prints exactly what is present or missing |
-| `lib/selfcheck.sh` | `bash -n` and `py_compile` on every tool before the 8 GB job starts |
-| `lib/boot_stage.sh` | drives TOOL 03 then TOOL 04 across all boot images, and prints the recovery evidence |
-| `lib/fs_stage.sh` | magic-byte routing, then TOOL 05 per filesystem image |
-| `lib/gitlab_project.sh` | creates or reuses the GitLab project |
-| `lib/summary.sh` | writes an honest job summary even when the job failed |
+Every workflow step is its own script. The YAML contains no heredocs at all.
 
-## Install the workflow (one move, no copy/paste)
+| Script | Step |
+|--------|------|
+| `lib/preflight.sh` | Validates `GITLAB_TOKEN`, resolves the GitLab account, prints the locked device identity |
+| `lib/env_setup.sh` | Frees disk, picks the biggest volume as `$WORK`, exports `$DL` `$RAW` `$DUMP` `$TOOLS` |
+| `lib/install_deps.sh` | `aria2`, `erofs-utils`, `android-sdk-libsparse-utils`, `lz4`, `zstd`, `git-lfs`, ... |
+| `lib/selfcheck.sh` | `bash -n` + `py_compile` on every tool, and `chmod +x`, **before** downloading 8 GB |
+| `lib/boot_stage.sh` | Runs TOOL 03 then TOOL 04 over every boot-ish image |
+| `lib/fs_stage.sh` | Magic-byte routing into TOOL 05; keeps boot-ish images raw at the dump root |
+| `lib/gitlab_project.sh` | Creates or reuses the GitLab project, exports slug / id / url |
+| `lib/summary.sh` | Honest job summary, runs with `if: always()` |
 
-`tools/dump.yml` is the workflow. A GitHub integration is not allowed to write
-inside `.github/workflows/`, so it was parked here. To activate it:
+## Resume model - the whole point
 
-1. Open `tools/dump.yml` on GitHub and click the pencil (Edit).
-2. In the filename box at the top, replace the name with
-   `../.github/workflows/dump.yml`
-3. Commit changes.
+Upload order is deliberate: small and important first, the monsters last.
+
+```
+meta -> boot -> images -> dlkm -> product -> odm -> system_ext -> vendor -> system -> tr_* -> rest
+```
+
+1. When a group finishes, its name is appended to `dump_state.txt` and pushed **in the same commit as the group itself**.
+2. If the job dies at any point, everything already pushed is on GitLab for good.
+3. Re-run the workflow: it does `git clone --filter=blob:none --depth=1` of the branch, reads `dump_state.txt`, skips finished groups, and continues where it stopped.
+4. No `--force`, no history rewriting. To start over on purpose, set `RESET_BRANCH = true`.
+
+`recovery_ramdisk` lands in the `boot` group, the **second** thing pushed. Even if the
+runner dies after 40 minutes, the recovery tree source is already in your hands.
 
 ## One-time setup
 
-1. Create a GitLab personal access token with scopes `api` and `write_repository`.
-2. Add it as a repository secret named `GITLAB_TOKEN`
-   (Settings -> Secrets and variables -> Actions -> New repository secret).
-3. Actions tab -> **Android Full Dump (our own tools) -> GitLab** -> Run workflow.
+1. **Move this workflow into place.** GitHub blocks integrations from writing to
+   `.github/workflows/`, so the file ships here as `tools/dump.yml`. Open it, click the
+   pencil, change the filename field to `../.github/workflows/dump.yml`, commit. No copy-paste.
+2. **Add the GitLab token.** On gitlab.com create a personal access token with scopes
+   `api` and `write_repository`. Then in this repo:
+   Settings -> Secrets and variables -> Actions -> New repository secret, named exactly `GITLAB_TOKEN`.
+3. **Run it.** Actions -> "Android Full Dump (our own tools) -> GitLab" -> Run workflow.
+   Leave `GITLAB_GROUP` empty to use your personal namespace.
 
-Leave `GITLAB_GROUP` empty to dump into your personal GitLab namespace.
+## Things worth knowing
 
-## Resume model
+- **Huge raw filesystem images are not pushed by default, and that is correct.** No normal
+  dump stores `system.img` or `vendor.img`; the extracted tree *is* the content. The root keeps
+  the small important images: boot, dtbo, vbmeta, and the MTK firmware blobs. Result is roughly
+  6-8 GB instead of 26. Set `KEEP_BIG_IMAGES = true` if you really want them, but you will hit
+  the GitLab 10 GiB project cap.
+- **GitLab cap is 10 GiB per project.** TOOL 07 reads the real size from the API after every
+  push and warns at 9 GiB. If a push is refused for space, the log names the exact group that
+  stopped and confirms everything before it is safe.
+- **Timing.** `timeout-minutes: 350`. Download ~10 min, payload ~20-30, filesystems ~30-45,
+  upload ~60-90. Around 2.5-3 hours. If the timeout hits, re-run and it resumes.
+- **`boot.img` has no ramdisk on this device and that is normal.** It is GKI (`RAMDISK_SZ 0`);
+  the real ramdisk lives in `vendor_boot`. The tool says so plainly instead of calling it a failure.
+- **Nothing fails silently.** If a partition cannot be unpacked, the raw image stays in the dump
+  and the step emits a `::warning::`.
 
-TOOL 07 pushes in this order, one commit and one push per group:
+## Dump layout
 
-`meta` -> `boot` -> `images` -> `dlkm` -> `product` -> `odm` -> `system_ext` -> `vendor` -> `system` -> `tr_*` -> `rest`
-
-Every finished group is appended to `dump_state.txt`, which is committed with the
-group itself. If the job dies, re-running the workflow on the same branch clones
-that state back, skips everything already on GitLab, and continues from where it
-stopped. Only `RESET_BRANCH=true` starts over.
+```
+android_dump_infinix_x6886/
+  all_files.txt  board-info.txt  README.md  proprietary-files.txt
+  kernel_config.txt  kernel_version.txt  dump_state.txt  ota_metadata.txt
+  boot.img  init_boot.img  vendor_boot.img  dtbo.img  vbmeta*.img
+  md1img.img  lk.img  preloader_raw.img  ...
+  boot/            kernel  dtb  header_info.json  ramdisk/
+  vendor_boot/     dtb  bootconfig  header_info.json  ramdisk/  recovery_ramdisk/
+  system/  system_ext/  vendor/  product/  odm/
+  vendor_dlkm/  odm_dlkm/  system_dlkm/
+  tr_*/
+```
