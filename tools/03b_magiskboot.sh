@@ -1,28 +1,31 @@
 #!/usr/bin/env bash
 # TOOL 03b - THE REAL magiskboot
 #
-# Why this works when DumprX's magiskboot died with "Illegal instruction":
+# Why this works where DumprX's magiskboot died with "Illegal instruction":
 # DumprX ships a prebuilt magiskboot for the wrong CPU/libc. The OFFICIAL
 # magiskboot inside the Magisk APK is a statically linked Linux binary, and
-# lib/x86_64/libmagiskboot.so runs natively on any x86_64 Linux host.
-# This is the documented way to get magiskboot on a PC (KernelSU docs, and
-# magiskboot_build's own release notes say to use the official APK binary).
+# lib/x86_64/libmagiskboot.so runs natively on any x86_64 Linux host. This is
+# the documented way to run magiskboot on a PC (KernelSU install docs, and
+# magiskboot_build's own release notes point at the official APK binary).
 #
 # usage:
 #   03b_magiskboot.sh get
 #   03b_magiskboot.sh unpack <image.img> <outdir>
-#   03b_magiskboot.sh cpio <ramdisk.cpio> <outdir>
+#   03b_magiskboot.sh cpio   <ramdisk.cpio> <outdir>
 set -uo pipefail
 
-MAGISK_VER="${MAGISK_VER:-v30.7}"
 BINDIR="${BINDIR:-/usr/local/bin}"
 MB="${BINDIR}/magiskboot"
+SCHEME="https"
+GH_HOST="github.com"
+REL_PATH="topjohnwu/Magisk/releases/download"
+VERSIONS="${MAGISK_VERSIONS:-v30.7 v29.0 v28.1 v27.0}"
 
 usable() { [ -x "$MB" ] && "$MB" 2>&1 | head -1 | grep -qi 'usage'; }
 
 get_magiskboot() {
   if usable; then
-    echo ">> magiskboot already present: $("$MB" 2>&1 | head -1)"
+    echo ">> magiskboot already here: $("$MB" 2>&1 | head -1)"
     return 0
   fi
 
@@ -33,48 +36,43 @@ get_magiskboot() {
     i?86)          lib="lib/x86/libmagiskboot.so" ;;
     *) echo "::warning::unknown CPU $(uname -m) - magiskboot skipped"; return 1 ;;
   esac
-  echo ">> host CPU $(uname -m) -> taking ${lib} from the official Magisk APK"
+  echo ">> host CPU is $(uname -m), so we need ${lib} from the official Magisk APK"
 
-  local apk="/tmp/magisk.apk" url ok=0
-  for url in \
-    "https://github.com/topjohnwu/Magisk/releases/download/${MAGISK_VER}/Magisk-${MAGISK_VER}.apk" \
-    "https://github.com/topjohnwu/Magisk/releases/download/v29.0/Magisk-v29.0.apk" \
-    "https://github.com/topjohnwu/Magisk/releases/download/v28.1/Magisk-v28.1.apk"
-  do
-    echo "   trying ${url}"
-    if curl -fsSL --retry 3 --retry-delay 3 -o "$apk" "$url" && [ -s "$apk" ]; then ok=1; break; fi
+  local apk="/tmp/magisk.apk" v url ok=0
+  for v in $VERSIONS; do
+    url="${SCHEME}://${GH_HOST}/${REL_PATH}/${v}/Magisk-${v}.apk"
+    echo "   trying Magisk ${v}"
+    rm -f "$apk"
+    if curl -fsSL --retry 3 --retry-delay 3 -o "$apk" "$url" && [ -s "$apk" ]; then
+      if unzip -p "$apk" "$lib" > "$MB" 2>/dev/null && [ -s "$MB" ]; then
+        chmod 0755 "$MB"
+        if usable; then ok=1; echo "   got magiskboot from Magisk ${v}"; break; fi
+      fi
+      rm -f "$MB"
+    fi
   done
-  [ "$ok" = 1 ] || { echo "::warning::could not download the Magisk APK"; return 1; }
-
-  if ! unzip -p "$apk" "$lib" > "$MB" 2>/dev/null || [ ! -s "$MB" ]; then
-    echo "::warning::${lib} not found inside the APK"; rm -f "$MB" "$apk"; return 1
-  fi
-  chmod 0755 "$MB"
   rm -f "$apk"
 
-  if ! usable; then
-    echo "::warning::the magiskboot binary does not run here - our python tools will do the work"
-    rm -f "$MB"; return 1
+  if [ "$ok" != 1 ]; then
+    echo "::warning::could not get a working magiskboot - our python parser will do the whole job"
+    rm -f "$MB"
+    return 1
   fi
-  echo ">> REAL magiskboot ready: $("$MB" 2>&1 | head -1)"
-  "$MB" 2>&1 | sed -n '1,6p' | sed 's/^/     /'
+  echo ">> REAL magiskboot is live:"
+  "$MB" 2>&1 | sed -n '1,8p' | sed 's/^/     /'
+  return 0
 }
 
 do_unpack() {
-  local img="$1" out="$2" abs
-  usable || { echo "::warning::magiskboot unavailable - skipping"; return 1; }
-  [ -s "$img" ] || { echo "::warning::$img missing"; return 1; }
+  local img="$1" out="$2" abs rc
+  usable || { echo "   (magiskboot unavailable)"; return 1; }
+  [ -s "$img" ] || return 1
   abs="$(readlink -f "$img")"
   mkdir -p "$out" || return 1
-  echo "---- magiskboot unpack $(basename "$img") ----"
-  # -h also dumps the parsed header next to the components
+  echo "   ---- magiskboot unpack -h $(basename "$img") ----"
   ( cd "$out" && "$MB" unpack -h "$abs" ) 2>&1 | sed 's/^/     /'
-  local rc=${PIPESTATUS[0]}
-  if [ "$rc" -ne 0 ]; then
-    echo "::warning::magiskboot unpack returned ${rc} for $(basename "$img")"
-    return 1
-  fi
-  ls -lh "$out" | sed 's/^/     /'
+  rc=${PIPESTATUS[0]}
+  [ "$rc" -eq 0 ] || { echo "::warning::magiskboot unpack exit ${rc} on $(basename "$img")"; return 1; }
   return 0
 }
 
